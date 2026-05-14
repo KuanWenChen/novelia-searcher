@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import subprocess
+import threading
 import time as _time
 import unicodedata
 import webbrowser
@@ -19,6 +21,24 @@ from textual.screen import Screen
 from textual.reactive import reactive
 
 from api import NoveliaAPI
+
+_s2twp = None
+_s2twp_lock = threading.Lock()
+
+
+def _get_s2twp():
+    global _s2twp
+    if _s2twp is None:
+        with _s2twp_lock:
+            if _s2twp is None:
+                import opencc
+                _s2twp = opencc.OpenCC("s2twp")
+    return _s2twp
+
+
+def _init_s2twp():
+    """在背景執行緒預先載入 opencc，避免首次使用時卡頓。"""
+    threading.Thread(target=_get_s2twp, daemon=True).start()
 
 log = logging.getLogger("ui")
 
@@ -184,6 +204,7 @@ class NovelListScreen(Screen):
         Binding("x", "next_page", "下一頁(x)"),
         Binding("space", "toggle_mark", "標記"),
         Binding("o", "open_in_browser", "瀏覽器開啟"),
+        Binding("c", "copy_title", "複製標題"),
         Binding("s", "cycle_sort", "切換排序"),
         Binding("r", "reload_char_map", "重載字元表"),
     ]
@@ -232,7 +253,7 @@ class NovelListScreen(Screen):
     def _get_display_title(self, item: dict) -> str:
         title = item.get("titleZh") or item.get("titleJp") or item.get("title", "")
         title = " ".join(title.split())
-        return normalize_for_table(title)
+        return normalize_for_table(_get_s2twp().convert(title))
 
     def _is_r18(self, item: dict) -> bool:
         attentions = item.get("attentions", [])
@@ -323,6 +344,18 @@ class NovelListScreen(Screen):
             url = self._get_novel_url(item)
             if url:
                 webbrowser.open(url)
+
+    def action_copy_title(self):
+        """按 c：複製標題到剪貼簿"""
+        item = self._get_selected_item()
+        if item:
+            title = self._get_display_title(item)
+            if title:
+                subprocess.run(
+                    ["clip"], input=title.encode("utf-16le"),
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                self.notify(f"已複製: {title}", timeout=2)
 
     def action_start_filter(self):
         self._filtering = True
@@ -596,21 +629,22 @@ from textual.message import Message
 
 class RecommendLoadingScreen(Screen):
     BINDINGS = [
-        Binding("escape", "go_back", "返回"),
+        Binding("escape", "go_back", "返回 / 中斷掃描"),
     ]
 
     class RecommendReady(Message):
         """推薦資料載入完成。"""
-        def __init__(self, data: list[dict], api: NoveliaAPI):
+        def __init__(self, data: list[dict], api: NoveliaAPI, cache_dir: str):
             super().__init__()
             self.data = data
             self.api = api
+            self.cache_dir = cache_dir
 
-    def __init__(self, api: NoveliaAPI, cache_dir: str, refresh: bool = False):
+    def __init__(self, api: NoveliaAPI, cache_dir: str):
         super().__init__()
         self.api = api
         self.cache_dir = cache_dir
-        self.force_refresh = refresh
+        self._cancel_event = threading.Event()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -628,53 +662,82 @@ class RecommendLoadingScreen(Screen):
         self.query_one("#loading-status", Static).update(text)
 
     def _load_recommend(self):
-        from recommend import load_cache, save_cache, build_recommendation_stats, enrich_stats_with_novel_info
+        from recommend import (scan_forum_incremental, add_entry_to_stats,
+                               prepare_recommend_data)
         import traceback
 
-        lines = []
+        lines: list[str] = []
+        stats_line_start = -1
+        stats: dict[tuple[str, str], dict] = {}
+        article_count = 0
 
         def log_msg(msg: str):
             lines.append(msg)
             self._update_status("\n".join(lines))
 
-        try:
-            forum_data = None
-            if not self.force_refresh:
-                forum_data = load_cache(self.cache_dir)
-                if forum_data:
-                    log_msg(f"  使用快取資料（{len(forum_data)} 篇文章）")
-
-            if forum_data is None:
-                log_msg("  開始掃描論壇...")
-
-                def on_scan_progress(current, total, msg):
-                    if lines and lines[-1].startswith("  掃描"):
-                        lines[-1] = f"  掃描進度: {msg}"
-                    else:
-                        lines.append(f"  掃描進度: {msg}")
+        def update_progress_line(msg: str, prefix: str):
+            for i, line in enumerate(lines):
+                if line.startswith(prefix):
+                    lines[i] = f"{prefix}{msg}"
                     self._update_status("\n".join(lines))
+                    return
+            lines.append(f"{prefix}{msg}")
+            self._update_status("\n".join(lines))
 
-                forum_data = self.api.scan_forum(on_progress=on_scan_progress)
-                log_msg(f"  掃描完成，共 {len(forum_data)} 篇文章。")
-                save_cache(self.cache_dir, forum_data)
-                log_msg("  快取已儲存。")
+        def update_stats_display():
+            nonlocal stats_line_start
+            if stats_line_start >= 0:
+                del lines[stats_line_start:]
+            else:
+                stats_line_start = len(lines)
 
-            stats = build_recommendation_stats(forum_data)
-            log_msg(f"  共找到 {len(stats)} 部被提及的小說，正在取得詳細資訊...")
+            if not stats:
+                return
 
-            def on_enrich_progress(current, total, msg):
-                if lines and lines[-1].startswith("  取得"):
-                    lines[-1] = f"  取得小說資訊: {msg}"
-                else:
-                    lines.append(f"  取得小說資訊: {msg}")
-                self._update_status("\n".join(lines))
+            sorted_stats = sorted(stats.items(), key=lambda x: x[1]["total_count"], reverse=True)
+            lines.append(f"\n  目前已處理 {article_count} 篇文章，找到 {len(sorted_stats)} 部被提及的小說")
+            lines.append("  ─" * 30)
+            for rank, ((provider, novel_id), val) in enumerate(sorted_stats, 1):
+                nid = novel_id if len(novel_id) <= 20 else novel_id[:17] + "..."
+                lines.append(
+                    f"  {rank:>2}. {provider}/{nid}"
+                    f"  — 提到 {val['total_count']} 次"
+                    f"（文章 {val['article_count']} + 留言 {val['comment_count']}）"
+                )
+            self._update_status("\n".join(lines))
 
-            recommend_data = enrich_stats_with_novel_info(self.api, stats, on_progress=on_enrich_progress)
-            log_msg(f"  完成！共 {len(recommend_data)} 部小說。")
+        def on_scan_progress(current, total, msg):
+            update_progress_line(msg, "  掃描進度: ")
+
+        def on_article(entry, is_cached):
+            nonlocal article_count
+            article_count += 1
+            add_entry_to_stats(entry, stats)
+            update_stats_display()
+
+        try:
+            log_msg("  開始掃描論壇...")
+
+            scan_forum_incremental(
+                self.api, self.cache_dir,
+                force_refresh=False,
+                on_progress=on_scan_progress,
+                on_article=on_article,
+                cancel_check=lambda: self._cancel_event.is_set(),
+            )
+
+            if self._cancel_event.is_set():
+                log_msg("\n  掃描已中斷，使用目前已掃描的資料。")
+
+            if not stats:
+                log_msg("  沒有找到任何被提及的小說。")
+                return
+
+            recommend_data = prepare_recommend_data(stats, self.cache_dir)
 
             self.app.call_from_thread(
                 self.post_message,
-                self.RecommendReady(recommend_data, self.api),
+                self.RecommendReady(recommend_data, self.api, self.cache_dir),
             )
         except Exception as e:
             tb = traceback.format_exc()
@@ -682,41 +745,99 @@ class RecommendLoadingScreen(Screen):
             log.exception("論壇推薦統計載入失敗")
 
     def action_go_back(self):
+        self._cancel_event.set()
         self.app.pop_screen()
 
 
 # ── 推薦統計列表頁 ──
 
 class RecommendScreen(NovelListScreen):
-    def __init__(self, api: NoveliaAPI, recommend_data: list[dict]):
+    def __init__(self, api: NoveliaAPI, recommend_data: list[dict], cache_dir: str):
         super().__init__(api, title="論壇推薦統計")
         self._recommend_data = recommend_data
+        self._cache_dir = cache_dir
+        self._cancel_enrich = threading.Event()
+
+    KEYWORD_WIDTH = 50
+    TITLE_WIDTH = 140
 
     def _setup_columns(self, table: DataTable):
-        table.add_columns(" ", "標題", "總提到", "文章提到", "留言提到", "小說留言數", "連結")
+        table.add_columns(" ", "標題", "總提到", "文章提到", "留言提到", "小說留言數", "標籤")
 
     def _load_data(self):
         self._items_original = list(self._recommend_data)
         self.items = self._recommend_data
         self.total_pages = 1
         self._refresh_table()
+        # 背景逐筆載入尚未取得的小說資訊
+        has_unenriched = any(not item.get("enriched") for item in self.items)
+        if has_unenriched:
+            self.run_worker(self._enrich_missing, thread=True)
 
     def _get_display_title(self, item: dict) -> str:
-        return item.get("title", "")
-
-    TITLE_WIDTH = 140
+        title = item.get("title", "")
+        title = " ".join(title.split())
+        return normalize_for_table(_get_s2twp().convert(title))
 
     def _get_row_data(self, item: dict) -> tuple:
         title = self._get_display_title(item)
         title = truncate_to_width(title, self.TITLE_WIDTH)
+        keywords = ", ".join(item.get("keywords") or [])
+        keywords = truncate_to_width(normalize_for_table(keywords), self.KEYWORD_WIDTH)
         return (
             title,
             str(item.get("total_count", 0)),
             str(item.get("article_count", 0)),
             str(item.get("comment_count", 0)),
             str(item.get("novel_comment_count", 0)),
-            item.get("link", ""),
+            keywords,
         )
+
+    def _enrich_missing(self):
+        """背景逐筆取得小說資訊並更新表格列。"""
+        from recommend import fetch_novel_info, load_novel_info_cache, save_novel_info_cache
+
+        novel_cache = load_novel_info_cache(self._cache_dir)
+        unenriched = [item for item in self.items if not item.get("enriched")]
+        total = len(unenriched)
+
+        for i, item in enumerate(unenriched):
+            if self._cancel_enrich.is_set():
+                break
+
+            provider = item["provider"]
+            novel_id = item["novel_id"]
+            info = fetch_novel_info(self.api, provider, novel_id)
+
+            if info:
+                key = f"{provider}/{novel_id}"
+                novel_cache[key] = info
+                save_novel_info_cache(self._cache_dir, novel_cache)
+
+                item["title"] = info["title"]
+                item["keywords"] = info["keywords"]
+                item["novel_comment_count"] = info["novel_comment_count"]
+                item["attentions"] = info["attentions"]
+            item["enriched"] = True
+
+            self.app.call_from_thread(self._on_enrich_update, i + 1, total)
+
+    def _on_enrich_update(self, current: int, total: int):
+        self._refresh_table()
+        sort_name = self.SORT_MODES[self._sort_index][0]
+        status = self.query_one("#status-bar", Label)
+        if current < total:
+            status.update(
+                f"  共 {len(self.items)} 筆"
+                f"    排序: {sort_name}"
+                f"    小說資訊載入中 {current}/{total}"
+            )
+        else:
+            status.update(
+                f"  共 {len(self.items)} 筆"
+                f"    排序: {sort_name}"
+                f"    小說資訊載入完成"
+            )
 
     def _get_selected_item(self) -> dict | None:
         table = self.query_one("#novel-table", DataTable)
@@ -735,6 +856,9 @@ class RecommendScreen(NovelListScreen):
             novel_id = item.get("novel_id", "")
             if provider and novel_id:
                 self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
+
+    def on_unmount(self):
+        self._cancel_enrich.set()
 
 
 # ── 主應用（含主選單） ──
@@ -793,6 +917,7 @@ class NoveliaApp(App):
         super().__init__()
         self.api = api
         self.cache_dir = cache_dir
+        _init_s2twp()
         log.info("NoveliaApp.__init__ 完成")
 
     def compose(self) -> ComposeResult:
@@ -802,7 +927,6 @@ class NoveliaApp(App):
         yield OptionList(
             Option("搜尋小說", id="search"),
             Option("論壇推薦統計", id="recommend"),
-            Option("論壇推薦統計（重新掃描）", id="recommend-refresh"),
             Option("離開", id="quit"),
             id="main-menu",
         )
@@ -819,11 +943,7 @@ class NoveliaApp(App):
             self.push_screen(SearchFormScreen(self.api))
         elif option_id == "recommend":
             self.push_screen(
-                RecommendLoadingScreen(self.api, self.cache_dir, refresh=False)
-            )
-        elif option_id == "recommend-refresh":
-            self.push_screen(
-                RecommendLoadingScreen(self.api, self.cache_dir, refresh=True)
+                RecommendLoadingScreen(self.api, self.cache_dir)
             )
         elif option_id == "quit":
             self.exit()
@@ -832,4 +952,4 @@ class NoveliaApp(App):
         self, event: RecommendLoadingScreen.RecommendReady
     ):
         self.pop_screen()
-        self.push_screen(RecommendScreen(event.api, event.data))
+        self.push_screen(RecommendScreen(event.api, event.data, event.cache_dir))

@@ -1,10 +1,9 @@
 import re
-import time
 import httpx
 
 BASE_URL = "https://n.novelia.cc/api"
 NOVELIA_LINK_PATTERN = re.compile(
-    r"(?:https?://)?n\.novelia\.cc/novel/(\w+)/([\w-]+)"
+    r"(?:https?://)?n\.novelia\.cc/novel/([A-Za-z0-9_]+)/([A-Za-z0-9_-]+)"
 )
 
 
@@ -73,40 +72,6 @@ class NoveliaAPI:
         data = self.get_comments(f"web-{provider}-{novel_id}", page=0, page_size=1)
         return data["pageNumber"]
 
-    # ── 論壇掃描 ──
-
-    def scan_forum(self, on_progress=None):
-        """掃描整個 General 論壇，回傳所有文章內容與留言。
-
-        on_progress(current, total, title) 用於回報進度。
-        回傳: list[dict]，每個 dict 包含:
-            - article: 文章完整資料（含 content）
-            - comments: 該文章的所有留言
-        """
-        first_page = self.get_article_list(page=0, page_size=20)
-        total_pages = first_page["pageNumber"]
-
-        all_article_ids = []
-        all_article_ids.extend(item["id"] for item in first_page["items"])
-
-        for p in range(1, total_pages):
-            time.sleep(self.scan_interval)
-            page_data = self.get_article_list(page=p, page_size=20)
-            all_article_ids.extend(item["id"] for item in page_data["items"])
-            if on_progress:
-                on_progress(p + 1, total_pages, f"取得文章列表 {p + 1}/{total_pages}")
-
-        results = []
-        total_articles = len(all_article_ids)
-        for i, aid in enumerate(all_article_ids):
-            time.sleep(self.scan_interval)
-            if on_progress:
-                on_progress(i + 1, total_articles, f"掃描文章 {i + 1}/{total_articles}")
-            article = self.get_article(aid)
-            comments = self.get_all_comments(f"article-{aid}")
-            results.append({"article": article, "comments": comments})
-
-        return results
 
 
 def extract_novel_links(text: str) -> list[tuple[str, str]]:
