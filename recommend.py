@@ -52,7 +52,7 @@ def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
                            on_progress=None,
                            on_article=None,
                            cancel_check=None):
-    """漸進式掃描論壇，逐篇寫入快取。
+    """漸進式掃描論壇，逐頁交錯：取得列表 → 處理文章 → 取下一頁。
 
     on_progress(current, total, msg): 進度回報
     on_article(entry, is_cached): 每篇文章處理完後回呼
@@ -60,105 +60,129 @@ def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
 
     回傳: list[dict] (所有已處理的文章資料)
 
-    Phase 1 優化: 文章列表按更新時間排序（最新在前）。若某一頁的
+    提前結束優化: 文章列表按更新時間排序（最新在前）。若某一頁的
     所有文章快取皆有效，且總頁數與快取記錄一致，代表後續更舊的
     文章也不會有變動，可直接使用快取跳過剩餘頁面。
     """
     cache = {} if force_refresh else load_cache(cache_dir)
-    cached_total_articles = cache.get("_meta", {}).get("total_articles", -1)
+    cached_meta = cache.get("_meta", {})
+    cached_total_articles = cached_meta.get("total_articles", -1)
+    cached_total_pages = cached_meta.get("total_pages", -1)
 
-    # Phase 1: 取得文章列表（含提前結束優化）
     page_size = 40
     first_page = api.get_article_list(page=0, page_size=page_size)
     total_pages = first_page["pageNumber"]
 
-    article_list: list[tuple[str, int]] = [
+    cached_article_count = len(_cache_articles(cache))
+    can_early_exit = (cached_article_count == cached_total_articles
+                      and total_pages == cached_total_pages)
+
+    list_complete = True
+    seen_ids: set[str] = set()
+    article_index = 0
+
+    def _process_page(page_articles: list[tuple[str, int]]) -> bool:
+        """處理一頁的文章，回傳 False 表示被取消。"""
+        nonlocal article_index
+        for aid, update_at in page_articles:
+            if cancel_check and cancel_check():
+                return False
+            seen_ids.add(aid)
+            article_index += 1
+
+            cached_entry = cache.get(aid)
+            if cached_entry and cached_entry.get("updateAt") == update_at:
+                if on_progress:
+                    on_progress(article_index, -1, f"文章 {article_index}（快取）")
+                if on_article:
+                    on_article(cached_entry, True)
+            else:
+                time.sleep(api.scan_interval)
+                if on_progress:
+                    on_progress(article_index, -1, f"掃描文章 {article_index}")
+                article = api.get_article(aid)
+                comments = api.get_all_comments(f"article-{aid}")
+                entry = {"article": article, "comments": comments,
+                         "updateAt": update_at}
+                cache[aid] = entry
+                cache["_meta"] = {"total_articles": len(_cache_articles(cache)),
+                                  "total_pages": total_pages}
+                save_cache(cache_dir, cache)
+                if on_article:
+                    on_article(entry, False)
+        return True
+
+    # ── 第 1 頁：取得列表 → 處理文章 ──
+    first_articles = [
         (item["id"], item.get("updateAt", 0)) for item in first_page["items"]
     ]
 
-    list_complete = True  # 是否完整取得了所有文章列表
-    early_exit = False
-
-    # 快取中的文章數量（排除 _meta）
-    cached_article_count = len(_cache_articles(cache))
-
-    # 判斷是否可以提前結束的條件：
-    # 1. 快取中的文章數量與上次完整掃描時記錄的總數一致
-    # 2. 該頁所有文章都在快取中且 updateAt 一致
-    can_early_exit = (cached_article_count == cached_total_articles)
-
-    if can_early_exit and _page_all_cached(article_list, cache):
-        early_exit = True
+    if can_early_exit and _page_all_cached(first_articles, cache):
+        # 第 1 頁全部命中，處理後跳過剩餘頁面
         if on_progress:
             on_progress(total_pages, total_pages,
                         f"文章列表第 1 頁快取命中，跳過剩餘 {total_pages - 1} 頁")
+        if not _process_page(first_articles):
+            return list(_cache_articles(cache).values())
+        # 補上快取中剩餘的文章
+        for aid, entry in _cache_articles(cache).items():
+            if aid not in seen_ids:
+                seen_ids.add(aid)
+                article_index += 1
+                if on_article:
+                    on_article(entry, True)
     else:
+        # 處理第 1 頁文章
+        if not _process_page(first_articles):
+            return list(_cache_articles(cache).values())
+
+        # ── 第 2 頁起：取得列表 → 處理文章 → 下一頁 ──
         for p in range(1, total_pages):
             if cancel_check and cancel_check():
                 list_complete = False
                 break
+
             time.sleep(api.scan_interval)
             page_data = api.get_article_list(page=p, page_size=page_size)
-            page_articles = [(item["id"], item.get("updateAt", 0)) for item in page_data["items"]]
-            article_list.extend(page_articles)
+            page_articles = [
+                (item["id"], item.get("updateAt", 0))
+                for item in page_data["items"]
+            ]
             if on_progress:
-                on_progress(p + 1, total_pages, f"取得文章列表 {p + 1}/{total_pages}")
+                on_progress(article_index, -1,
+                            f"取得文章列表 {p + 1}/{total_pages}")
 
-            # 若此頁全部快取命中且文章總數一致，後續頁面可跳過
+            # 提前結束檢查
             if can_early_exit and _page_all_cached(page_articles, cache):
-                early_exit = True
+                if not _process_page(page_articles):
+                    break
                 if on_progress:
                     remaining = total_pages - p - 1
-                    on_progress(total_pages, total_pages,
-                                f"文章列表第 {p + 1} 頁快取命中，跳過剩餘 {remaining} 頁")
+                    on_progress(article_index, -1,
+                                f"第 {p + 1} 頁快取命中，跳過剩餘 {remaining} 頁")
+                # 補上快取中剩餘的文章
+                for aid, entry in _cache_articles(cache).items():
+                    if aid not in seen_ids:
+                        seen_ids.add(aid)
+                        article_index += 1
+                        if on_article:
+                            on_article(entry, True)
                 break
 
-    if cancel_check and cancel_check():
-        return list(_cache_articles(cache).values())
+            # 處理該頁文章
+            if not _process_page(page_articles):
+                list_complete = False
+                break
 
-    if early_exit:
-        # 把快取中尚未出現在 article_list 的文章補上
-        seen_ids = {aid for aid, _ in article_list}
-        for aid, entry in _cache_articles(cache).items():
-            if aid not in seen_ids:
-                article_list.append((aid, entry.get("updateAt", 0)))
-
-    # 只有在完整取得文章列表時才清理已刪除的文章
+    # 清理已刪除的文章（僅在完整掃描時）
     if list_complete:
-        current_ids = {aid for aid, _ in article_list}
         for old_id in list(cache.keys()):
-            if old_id != "_meta" and old_id not in current_ids:
+            if old_id != "_meta" and old_id not in seen_ids:
                 del cache[old_id]
 
-    # Phase 2: 逐篇處理（快取命中則跳過 API 呼叫）
-    total = len(article_list)
-    for i, (aid, update_at) in enumerate(article_list):
-        if cancel_check and cancel_check():
-            break
-
-        cached_entry = cache.get(aid)
-        if cached_entry and cached_entry.get("updateAt") == update_at:
-            # 快取命中，不需重新抓取
-            if on_progress:
-                on_progress(i + 1, total, f"文章 {i + 1}/{total}（快取）")
-            if on_article:
-                on_article(cached_entry, True)
-        else:
-            # 需要抓取（新文章或已更新）
-            time.sleep(api.scan_interval)
-            if on_progress:
-                on_progress(i + 1, total, f"掃描文章 {i + 1}/{total}")
-            article = api.get_article(aid)
-            comments = api.get_all_comments(f"article-{aid}")
-            entry = {"article": article, "comments": comments, "updateAt": update_at}
-            cache[aid] = entry
-            cache["_meta"] = {"total_articles": len(_cache_articles(cache))}
-            save_cache(cache_dir, cache)
-            if on_article:
-                on_article(entry, False)
-
-    # 儲存最終狀態（含 metadata）
-    cache["_meta"] = {"total_articles": len(_cache_articles(cache))}
+    # 儲存最終狀態
+    cache["_meta"] = {"total_articles": len(_cache_articles(cache)),
+                      "total_pages": total_pages}
     save_cache(cache_dir, cache)
 
     return list(_cache_articles(cache).values())

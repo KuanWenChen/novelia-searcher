@@ -77,24 +77,43 @@ _load_data()
 
 ### 內部呼叫 `scan_forum_incremental`
 
-這個函式分兩階段：
+逐頁交錯處理：取得一頁列表 → 處理該頁文章 → 取得下一頁列表。
+不再分成「先收集所有列表」和「再逐篇處理」兩個階段。
 
-#### Phase 1：取得文章列表
+#### 逐頁流程
 
 ```
-呼叫 API 取得文章列表（每頁 40 篇）
+取得第 1 頁文章列表（同時得知 total_pages）
   │
-  ├─ 提前結束優化：
-  │    條件：快取文章數 == 上次記錄的總數 AND 該頁所有文章的 updateAt 都與快取一致
-  │    效果：跳過剩餘頁面，把快取中的舊文章補入列表
+  ├─ 提前結束檢查（見下方）
+  │    ├─ 命中 → 處理第 1 頁文章 → 補上快取中剩餘文章 → 結束
+  │    └─ 未命中 → 繼續
   │
-  └─ 完整取得文章列表後，清理快取中已被刪除的文章
+  ├─ 處理第 1 頁文章
+  │
+  ├─ 取得第 2 頁列表 → 提前結束檢查 → 處理第 2 頁文章
+  ├─ 取得第 3 頁列表 → 提前結束檢查 → 處理第 3 頁文章
+  ├─ ...
+  │
+  └─ 全部頁面處理完畢 → 清理已刪除文章 → 儲存快取
 ```
 
-#### Phase 2：逐篇處理
+#### 提前結束優化
 
 ```
-對每篇文章 (article_id, updateAt)：
+條件（三者皆滿足才能提前結束）：
+  1. 快取文章數 == 上次記錄的總數
+  2. API 回傳的 total_pages == 上次記錄的 total_pages
+  3. 該頁所有文章的 updateAt 都與快取一致
+
+效果：處理完該頁文章後，跳過剩餘頁面，
+      把快取中未出現的文章補入（呼叫 on_article）
+```
+
+#### 處理每篇文章（`_process_page`）
+
+```
+對該頁每篇文章 (article_id, updateAt)：
   │
   ├─ forum_cache 命中（article_id 存在且 updateAt 一致）？
   │    ├─ 是 → 不呼叫 API，直接用快取資料呼叫 on_article(entry, is_cached=True)
@@ -230,7 +249,7 @@ _cancel_event 被設定後：
 
 | 層 | 位置 | 判斷 | 命中時的效果 |
 |----|------|------|-------------|
-| **forum_cache** | `scan_forum_incremental` Phase 2 | `article_id` 存在且 `updateAt` 一致 | 跳過 API 呼叫（不重新抓文章內容），直接用快取的 `{article, comments}` |
+| **forum_cache** | `scan_forum_incremental` `_process_page` | `article_id` 存在且 `updateAt` 一致 | 跳過 API 呼叫（不重新抓文章內容），直接用快取的 `{article, comments}` |
 | **stats_cache** | `on_article` 回呼 | `article_id` 存在且 `updateAt` 一致 | 跳過連結提取（不重新 parse 文章內容），統計結果沿用快取 |
 
 ```
