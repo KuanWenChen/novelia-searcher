@@ -1,0 +1,12 @@
+config.json
+__pycache__/
+*.pyc
+*.pyo
+cache/
+debug.log
+*.spec
+dist/
+build/
+.claude/
+ai-temp-command.md
+image*.png
