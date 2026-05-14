@@ -7,6 +7,7 @@ from api import NoveliaAPI, extract_novel_links, extract_links_from_comments
 
 CACHE_FILE = "forum_cache.json"
 NOVEL_INFO_CACHE_FILE = "novel_info_cache.json"
+STATS_CACHE_FILE = "stats_cache.json"
 
 
 def get_cache_path(cache_dir: str) -> str:
@@ -64,10 +65,11 @@ def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
     文章也不會有變動，可直接使用快取跳過剩餘頁面。
     """
     cache = {} if force_refresh else load_cache(cache_dir)
-    cached_total_pages = cache.get("_meta", {}).get("total_pages", -1)
+    cached_total_articles = cache.get("_meta", {}).get("total_articles", -1)
 
     # Phase 1: 取得文章列表（含提前結束優化）
-    first_page = api.get_article_list(page=0, page_size=40)
+    page_size = 40
+    first_page = api.get_article_list(page=0, page_size=page_size)
     total_pages = first_page["pageNumber"]
 
     article_list: list[tuple[str, int]] = [
@@ -77,8 +79,15 @@ def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
     list_complete = True  # 是否完整取得了所有文章列表
     early_exit = False
 
-    # 檢查第一頁是否可以提前結束
-    if total_pages == cached_total_pages and _page_all_cached(article_list, cache):
+    # 快取中的文章數量（排除 _meta）
+    cached_article_count = len(_cache_articles(cache))
+
+    # 判斷是否可以提前結束的條件：
+    # 1. 快取中的文章數量與上次完整掃描時記錄的總數一致
+    # 2. 該頁所有文章都在快取中且 updateAt 一致
+    can_early_exit = (cached_article_count == cached_total_articles)
+
+    if can_early_exit and _page_all_cached(article_list, cache):
         early_exit = True
         if on_progress:
             on_progress(total_pages, total_pages,
@@ -89,14 +98,14 @@ def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
                 list_complete = False
                 break
             time.sleep(api.scan_interval)
-            page_data = api.get_article_list(page=p, page_size=40)
+            page_data = api.get_article_list(page=p, page_size=page_size)
             page_articles = [(item["id"], item.get("updateAt", 0)) for item in page_data["items"]]
             article_list.extend(page_articles)
             if on_progress:
                 on_progress(p + 1, total_pages, f"取得文章列表 {p + 1}/{total_pages}")
 
-            # 若此頁全部快取命中且總頁數一致，後續頁面可跳過
-            if total_pages == cached_total_pages and _page_all_cached(page_articles, cache):
+            # 若此頁全部快取命中且文章總數一致，後續頁面可跳過
+            if can_early_exit and _page_all_cached(page_articles, cache):
                 early_exit = True
                 if on_progress:
                     remaining = total_pages - p - 1
@@ -143,61 +152,89 @@ def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
             comments = api.get_all_comments(f"article-{aid}")
             entry = {"article": article, "comments": comments, "updateAt": update_at}
             cache[aid] = entry
-            cache["_meta"] = {"total_pages": total_pages}
+            cache["_meta"] = {"total_articles": len(_cache_articles(cache))}
             save_cache(cache_dir, cache)
             if on_article:
                 on_article(entry, False)
 
     # 儲存最終狀態（含 metadata）
-    cache["_meta"] = {"total_pages": total_pages}
+    cache["_meta"] = {"total_articles": len(_cache_articles(cache))}
     save_cache(cache_dir, cache)
 
     return list(_cache_articles(cache).values())
 
 
-def add_entry_to_stats(entry: dict, stats: dict[tuple[str, str], dict]):
-    """將一篇文章的資料加入推薦統計。"""
+def compute_entry_links(entry: dict) -> dict:
+    """從一篇文章提取去重後的小說連結，回傳可序列化的結果。"""
     article = entry["article"]
     comments = entry["comments"]
 
-    article_links = extract_novel_links(article.get("content", ""))
-    seen_in_article: set[tuple[str, str]] = set()
-    for provider, novel_id in article_links:
-        key = (provider, novel_id)
-        if key not in seen_in_article:
-            if key not in stats:
-                stats[key] = {"article_count": 0, "comment_count": 0, "total_count": 0, "articles": []}
-            stats[key]["article_count"] += 1
-            stats[key]["articles"].append(article.get("title", ""))
-            seen_in_article.add(key)
+    article_links = list({
+        (p, n) for p, n in extract_novel_links(article.get("content", ""))
+    })
+    comment_links = list({
+        (p, n) for p, n in extract_links_from_comments(comments)
+    })
 
-    comment_links = extract_links_from_comments(comments)
-    seen_in_comments: set[tuple[str, str]] = set()
-    for provider, novel_id in comment_links:
-        key = (provider, novel_id)
-        if key not in seen_in_comments:
-            if key not in stats:
-                stats[key] = {"article_count": 0, "comment_count": 0, "total_count": 0, "articles": []}
-            stats[key]["comment_count"] += 1
-            seen_in_comments.add(key)
-
-    for key in seen_in_article | seen_in_comments:
-        stats[key]["total_count"] = stats[key]["article_count"] + stats[key]["comment_count"]
+    return {
+        "title": article.get("title", ""),
+        "article_links": article_links,
+        "comment_links": comment_links,
+    }
 
 
-def build_recommendation_stats(forum_data: list[dict]) -> dict[tuple[str, str], dict]:
-    """統計每部小說在論壇中被提及的次數。
+def load_stats_cache(cache_dir: str) -> dict[str, dict]:
+    """載入 per-article 統計快取。
 
-    回傳: {(provider, novelId): {
-        "article_count": int,
-        "comment_count": int,
-        "total_count": int,
-        "articles": list[str],  # 提到此小說的文章標題
-    }}
+    回傳 {article_id: {updateAt, title, article_links, comment_links}}。
     """
+    path = os.path.join(cache_dir, STATS_CACHE_FILE)
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_stats_cache(cache_dir: str, data: dict[str, dict]):
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, STATS_CACHE_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def build_stats_from_article_stats(
+    article_stats: dict[str, dict],
+) -> dict[tuple[str, str], dict]:
+    """從 per-article 連結快取重建聚合統計。"""
     stats: dict[tuple[str, str], dict] = {}
-    for entry in forum_data:
-        add_entry_to_stats(entry, stats)
+    for aid, adata in article_stats.items():
+        article_title = adata.get("title", "")
+
+        seen_in_article: set[tuple[str, str]] = set()
+        for p, nid in adata.get("article_links", []):
+            key = (p, nid)
+            if key not in seen_in_article:
+                if key not in stats:
+                    stats[key] = {"article_count": 0, "comment_count": 0,
+                                  "total_count": 0, "articles": []}
+                stats[key]["article_count"] += 1
+                stats[key]["articles"].append(article_title)
+                seen_in_article.add(key)
+
+        seen_in_comments: set[tuple[str, str]] = set()
+        for p, nid in adata.get("comment_links", []):
+            key = (p, nid)
+            if key not in seen_in_comments:
+                if key not in stats:
+                    stats[key] = {"article_count": 0, "comment_count": 0,
+                                  "total_count": 0, "articles": []}
+                stats[key]["comment_count"] += 1
+                seen_in_comments.add(key)
+
+        for key in seen_in_article | seen_in_comments:
+            stats[key]["total_count"] = (
+                stats[key]["article_count"] + stats[key]["comment_count"]
+            )
     return stats
 
 

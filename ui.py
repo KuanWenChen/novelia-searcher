@@ -19,6 +19,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 from textual.screen import Screen
 from textual.reactive import reactive
+import queue
 
 from api import NoveliaAPI
 
@@ -622,141 +623,29 @@ class SearchScreen(NovelListScreen):
         return (title, str(total), str(comments), date_str, keywords)
 
 
-# ── 推薦統計載入頁 ──
-
-from textual.message import Message
-
-
-class RecommendLoadingScreen(Screen):
-    BINDINGS = [
-        Binding("escape", "go_back", "返回 / 中斷掃描"),
-    ]
-
-    class RecommendReady(Message):
-        """推薦資料載入完成。"""
-        def __init__(self, data: list[dict], api: NoveliaAPI, cache_dir: str):
-            super().__init__()
-            self.data = data
-            self.api = api
-            self.cache_dir = cache_dir
-
-    def __init__(self, api: NoveliaAPI, cache_dir: str):
-        super().__init__()
-        self.api = api
-        self.cache_dir = cache_dir
-        self._cancel_event = threading.Event()
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        with VerticalScroll():
-            yield Static("  正在載入推薦統計...\n", id="loading-status", markup=False)
-        yield Footer()
-
-    def on_mount(self):
-        self.run_worker(self._load_recommend, thread=True)
-
-    def _update_status(self, text: str):
-        self.app.call_from_thread(self._set_status, text)
-
-    def _set_status(self, text: str):
-        self.query_one("#loading-status", Static).update(text)
-
-    def _load_recommend(self):
-        from recommend import (scan_forum_incremental, add_entry_to_stats,
-                               prepare_recommend_data)
-        import traceback
-
-        lines: list[str] = []
-        stats_line_start = -1
-        stats: dict[tuple[str, str], dict] = {}
-        article_count = 0
-
-        def log_msg(msg: str):
-            lines.append(msg)
-            self._update_status("\n".join(lines))
-
-        def update_progress_line(msg: str, prefix: str):
-            for i, line in enumerate(lines):
-                if line.startswith(prefix):
-                    lines[i] = f"{prefix}{msg}"
-                    self._update_status("\n".join(lines))
-                    return
-            lines.append(f"{prefix}{msg}")
-            self._update_status("\n".join(lines))
-
-        def update_stats_display():
-            nonlocal stats_line_start
-            if stats_line_start >= 0:
-                del lines[stats_line_start:]
-            else:
-                stats_line_start = len(lines)
-
-            if not stats:
-                return
-
-            sorted_stats = sorted(stats.items(), key=lambda x: x[1]["total_count"], reverse=True)
-            lines.append(f"\n  目前已處理 {article_count} 篇文章，找到 {len(sorted_stats)} 部被提及的小說")
-            lines.append("  ─" * 30)
-            for rank, ((provider, novel_id), val) in enumerate(sorted_stats, 1):
-                nid = novel_id if len(novel_id) <= 20 else novel_id[:17] + "..."
-                lines.append(
-                    f"  {rank:>2}. {provider}/{nid}"
-                    f"  — 提到 {val['total_count']} 次"
-                    f"（文章 {val['article_count']} + 留言 {val['comment_count']}）"
-                )
-            self._update_status("\n".join(lines))
-
-        def on_scan_progress(current, total, msg):
-            update_progress_line(msg, "  掃描進度: ")
-
-        def on_article(entry, is_cached):
-            nonlocal article_count
-            article_count += 1
-            add_entry_to_stats(entry, stats)
-            update_stats_display()
-
-        try:
-            log_msg("  開始掃描論壇...")
-
-            scan_forum_incremental(
-                self.api, self.cache_dir,
-                force_refresh=False,
-                on_progress=on_scan_progress,
-                on_article=on_article,
-                cancel_check=lambda: self._cancel_event.is_set(),
-            )
-
-            if self._cancel_event.is_set():
-                log_msg("\n  掃描已中斷，使用目前已掃描的資料。")
-
-            if not stats:
-                log_msg("  沒有找到任何被提及的小說。")
-                return
-
-            recommend_data = prepare_recommend_data(stats, self.cache_dir)
-
-            self.app.call_from_thread(
-                self.post_message,
-                self.RecommendReady(recommend_data, self.api, self.cache_dir),
-            )
-        except Exception as e:
-            tb = traceback.format_exc()
-            log_msg(f"\n  錯誤: {e}\n\n{tb}")
-            log.exception("論壇推薦統計載入失敗")
-
-    def action_go_back(self):
-        self._cancel_event.set()
-        self.app.pop_screen()
-
-
 # ── 推薦統計列表頁 ──
 
 class RecommendScreen(NovelListScreen):
-    def __init__(self, api: NoveliaAPI, recommend_data: list[dict], cache_dir: str):
+    """三執行緒並行：掃描論壇 / 載入小說資訊 / 使用者操作列表。"""
+
+    def __init__(self, api: NoveliaAPI, cache_dir: str):
         super().__init__(api, title="論壇推薦統計")
-        self._recommend_data = recommend_data
         self._cache_dir = cache_dir
-        self._cancel_enrich = threading.Event()
+        self._cancel_event = threading.Event()
+        # 掃描統計（由 scan 執行緒寫入，主執行緒讀取）
+        self._stats: dict[tuple[str, str], dict] = {}
+        self._stats_lock = threading.Lock()
+        # 小說資訊並行載入
+        self._novel_cache: dict[str, dict] = {}
+        self._novel_cache_lock = threading.Lock()
+        self._seen_novels: set[tuple[str, str]] = set()
+        self._enrich_queue: queue.Queue[tuple[str, str]] = None  # type: ignore
+        self._scan_done = threading.Event()
+        self._enrich_done = threading.Event()
+        self._article_stats: dict[str, dict] = {}
+        self._scan_article_count = 0
+        self._enrich_count = [0, 0]  # [completed, total_queued]
+        self._scan_status_msg = ""
 
     KEYWORD_WIDTH = 50
     TITLE_WIDTH = 140
@@ -765,14 +654,199 @@ class RecommendScreen(NovelListScreen):
         table.add_columns(" ", "標題", "總提到", "文章提到", "留言提到", "小說留言數", "標籤")
 
     def _load_data(self):
-        self._items_original = list(self._recommend_data)
-        self.items = self._recommend_data
+        from recommend import (load_novel_info_cache, load_stats_cache,
+                               build_stats_from_article_stats)
+
+        self._enrich_queue = queue.Queue()
+        self._novel_cache = load_novel_info_cache(self._cache_dir)
+        self._seen_novels = set(
+            tuple(k.split("/", 1)) for k in self._novel_cache.keys() if "/" in k
+        )
+
+        # 載入 per-article 統計快取 → 立即顯示列表
+        self._article_stats = load_stats_cache(self._cache_dir)
+        if self._article_stats:
+            with self._stats_lock:
+                self._stats = build_stats_from_article_stats(self._article_stats)
+                # 將已知小說加入 enrich 佇列
+                for key in self._stats.keys():
+                    if key not in self._seen_novels:
+                        self._seen_novels.add(key)
+                        self._enrich_count[1] += 1
+                        self._enrich_queue.put(key)
+            self._rebuild_items()
+
         self.total_pages = 1
+
+        # 啟動兩個背景執行緒
+        self.run_worker(self._scan_worker, thread=True)
+        self.run_worker(self._enrich_worker, thread=True)
+
+    # ── 執行緒 1：掃描論壇 ──
+
+    def _scan_worker(self):
+        from recommend import (scan_forum_incremental, compute_entry_links,
+                               save_stats_cache, build_stats_from_article_stats)
+
+        changed = False
+
+        def on_progress(current, total, msg):
+            self._scan_status_msg = msg
+            self.app.call_from_thread(self._update_status_bar)
+
+        def on_article(entry, is_cached):
+            nonlocal changed
+            aid = entry["article"]["id"]
+            update_at = entry.get("updateAt", 0)
+            self._scan_article_count += 1
+
+            # 統計快取命中 → 跳過
+            cached = self._article_stats.get(aid)
+            if cached and cached.get("updateAt") == update_at:
+                self.app.call_from_thread(self._update_status_bar)
+                return
+
+            # 新文章或已更新 → 計算連結並更新快取
+            changed = True
+            links = compute_entry_links(entry)
+            self._article_stats[aid] = {
+                "updateAt": update_at,
+                "title": links["title"],
+                "article_links": links["article_links"],
+                "comment_links": links["comment_links"],
+            }
+
+            with self._stats_lock:
+                self._stats = build_stats_from_article_stats(self._article_stats)
+                for key in self._stats.keys():
+                    if key not in self._seen_novels:
+                        self._seen_novels.add(key)
+                        self._enrich_count[1] += 1
+                        self._enrich_queue.put(key)
+            save_stats_cache(self._cache_dir, self._article_stats)
+            self.app.call_from_thread(self._rebuild_items)
+
+        try:
+            forum_data = scan_forum_incremental(
+                self.api, self._cache_dir,
+                force_refresh=False,
+                on_progress=on_progress,
+                on_article=on_article,
+                cancel_check=lambda: self._cancel_event.is_set(),
+            )
+
+            # 清理已刪除的文章
+            current_ids = {e["article"]["id"] for e in forum_data}
+            deleted = [aid for aid in list(self._article_stats.keys())
+                       if aid not in current_ids]
+            if deleted:
+                for aid in deleted:
+                    del self._article_stats[aid]
+                with self._stats_lock:
+                    self._stats = build_stats_from_article_stats(self._article_stats)
+                save_stats_cache(self._cache_dir, self._article_stats)
+                self.app.call_from_thread(self._rebuild_items)
+
+        except Exception as e:
+            log.exception("論壇掃描失敗")
+            self.app.call_from_thread(
+                self.notify, f"掃描錯誤: {e}", severity="error"
+            )
+        finally:
+            self._scan_done.set()
+            self.app.call_from_thread(self._update_status_bar)
+
+    # ── 執行緒 2：載入小說資訊 ──
+
+    def _enrich_worker(self):
+        from recommend import fetch_novel_info, save_novel_info_cache
+
+        while not self._cancel_event.is_set():
+            try:
+                provider, novel_id = self._enrich_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._scan_done.is_set() and self._enrich_queue.empty():
+                    break
+                continue
+
+            key = f"{provider}/{novel_id}"
+            with self._novel_cache_lock:
+                if key in self._novel_cache:
+                    self._enrich_count[0] += 1
+                    self._enrich_queue.task_done()
+                    self.app.call_from_thread(self._rebuild_items)
+                    continue
+
+            info = fetch_novel_info(self.api, provider, novel_id)
+            if info:
+                with self._novel_cache_lock:
+                    self._novel_cache[key] = info
+                    save_novel_info_cache(self._cache_dir, self._novel_cache)
+            self._enrich_count[0] += 1
+            self._enrich_queue.task_done()
+            self.app.call_from_thread(self._rebuild_items)
+
+        self._enrich_done.set()
+        self.app.call_from_thread(self._update_status_bar)
+
+    # ── 主執行緒：更新 UI ──
+
+    def _rebuild_items(self):
+        """從 stats + novel_cache 重建列表資料並刷新表格。"""
+        with self._stats_lock:
+            stats_snapshot = dict(self._stats)
+
+        results = []
+        for (provider, novel_id), val in stats_snapshot.items():
+            key = f"{provider}/{novel_id}"
+            with self._novel_cache_lock:
+                cached = self._novel_cache.get(key)
+            if cached:
+                title = cached.get("title", key)
+                keywords = cached.get("keywords", [])
+                novel_comment_count = cached.get("novel_comment_count", 0)
+                attentions = cached.get("attentions", [])
+            else:
+                title = key
+                keywords = []
+                novel_comment_count = 0
+                attentions = []
+
+            results.append({
+                "provider": provider,
+                "novel_id": novel_id,
+                "title": title,
+                "total_count": val["total_count"],
+                "article_count": val["article_count"],
+                "comment_count": val["comment_count"],
+                "novel_comment_count": novel_comment_count,
+                "link": f"https://n.novelia.cc/novel/{provider}/{novel_id}",
+                "keywords": keywords,
+                "attentions": attentions,
+            })
+
+        results.sort(key=lambda x: x["total_count"], reverse=True)
+        self._items_original = results
+        self._apply_sort()
         self._refresh_table()
-        # 背景逐筆載入尚未取得的小說資訊
-        has_unenriched = any(not item.get("enriched") for item in self.items)
-        if has_unenriched:
-            self.run_worker(self._enrich_missing, thread=True)
+        self._update_status_bar()
+
+    def _update_status_bar(self):
+        sort_name = self.SORT_MODES[self._sort_index][0]
+        parts = [f"  共 {len(self.items)} 筆", f"排序: {sort_name}"]
+
+        if not self._scan_done.is_set():
+            parts.append(f"掃描: {self._scan_status_msg}")
+        else:
+            parts.append(f"掃描完成（{self._scan_article_count} 篇）")
+
+        if not self._enrich_done.is_set() and self._enrich_count[1] > 0:
+            parts.append(f"小說資訊: {self._enrich_count[0]}/{self._enrich_count[1]}")
+        elif self._enrich_done.is_set():
+            parts.append("小說資訊載入完成")
+
+        status = self.query_one("#status-bar", Label)
+        status.update("    ".join(parts))
 
     def _get_display_title(self, item: dict) -> str:
         title = item.get("title", "")
@@ -793,52 +867,6 @@ class RecommendScreen(NovelListScreen):
             keywords,
         )
 
-    def _enrich_missing(self):
-        """背景逐筆取得小說資訊並更新表格列。"""
-        from recommend import fetch_novel_info, load_novel_info_cache, save_novel_info_cache
-
-        novel_cache = load_novel_info_cache(self._cache_dir)
-        unenriched = [item for item in self.items if not item.get("enriched")]
-        total = len(unenriched)
-
-        for i, item in enumerate(unenriched):
-            if self._cancel_enrich.is_set():
-                break
-
-            provider = item["provider"]
-            novel_id = item["novel_id"]
-            info = fetch_novel_info(self.api, provider, novel_id)
-
-            if info:
-                key = f"{provider}/{novel_id}"
-                novel_cache[key] = info
-                save_novel_info_cache(self._cache_dir, novel_cache)
-
-                item["title"] = info["title"]
-                item["keywords"] = info["keywords"]
-                item["novel_comment_count"] = info["novel_comment_count"]
-                item["attentions"] = info["attentions"]
-            item["enriched"] = True
-
-            self.app.call_from_thread(self._on_enrich_update, i + 1, total)
-
-    def _on_enrich_update(self, current: int, total: int):
-        self._refresh_table()
-        sort_name = self.SORT_MODES[self._sort_index][0]
-        status = self.query_one("#status-bar", Label)
-        if current < total:
-            status.update(
-                f"  共 {len(self.items)} 筆"
-                f"    排序: {sort_name}"
-                f"    小說資訊載入中 {current}/{total}"
-            )
-        else:
-            status.update(
-                f"  共 {len(self.items)} 筆"
-                f"    排序: {sort_name}"
-                f"    小說資訊載入完成"
-            )
-
     def _get_selected_item(self) -> dict | None:
         table = self.query_one("#novel-table", DataTable)
         if table.row_count == 0:
@@ -857,8 +885,21 @@ class RecommendScreen(NovelListScreen):
             if provider and novel_id:
                 self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
 
+    def action_cancel_filter_or_back(self):
+        if self._filtering:
+            self._filtering = False
+            filter_input = self.query_one("#filter-input", Input)
+            filter_input.display = False
+            filter_input.value = ""
+            self.filter_text = ""
+            self._refresh_table()
+            self.query_one("#novel-table", DataTable).focus()
+        else:
+            self._cancel_event.set()
+            self.app.pop_screen()
+
     def on_unmount(self):
-        self._cancel_enrich.set()
+        self._cancel_event.set()
 
 
 # ── 主應用（含主選單） ──
@@ -943,13 +984,8 @@ class NoveliaApp(App):
             self.push_screen(SearchFormScreen(self.api))
         elif option_id == "recommend":
             self.push_screen(
-                RecommendLoadingScreen(self.api, self.cache_dir)
+                RecommendScreen(self.api, self.cache_dir)
             )
         elif option_id == "quit":
             self.exit()
 
-    def on_recommend_loading_screen_recommend_ready(
-        self, event: RecommendLoadingScreen.RecommendReady
-    ):
-        self.pop_screen()
-        self.push_screen(RecommendScreen(event.api, event.data, event.cache_dir))
