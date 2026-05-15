@@ -6,6 +6,7 @@ import threading
 import time as _time
 import unicodedata
 import webbrowser
+from collections import defaultdict
 
 from rich.text import Text
 
@@ -50,6 +51,9 @@ log = logging.getLogger("ui")
 CHAR_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "char_map.json")
 _char_map: dict[str, str] = {}
 
+TAG_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tag_map.json")
+_tag_map: dict[str, str] = {}
+
 
 def load_char_map():
     """從 char_map.json 載入字元替換表。"""
@@ -63,7 +67,25 @@ def load_char_map():
         _char_map = {}
 
 
+def load_tag_map():
+    """從 tag_map.json 載入標籤歸類表（variant → canonical）。"""
+    global _tag_map
+    try:
+        with open(TAG_MAP_PATH, "r", encoding="utf-8") as f:
+            _tag_map = json.load(f)
+        log.info(f"載入 tag_map.json，共 {len(_tag_map)} 筆")
+    except Exception as e:
+        log.warning(f"載入 tag_map.json 失敗: {e}")
+        _tag_map = {}
+
+
+def normalize_tag(tag: str) -> str:
+    """將標籤映射為正規化名稱，未定義則原樣回傳。"""
+    return _tag_map.get(tag, tag)
+
+
 load_char_map()
+load_tag_map()
 
 
 def normalize_for_table(s: str) -> str:
@@ -124,7 +146,7 @@ class NovelDetailScreen(Screen):
         visited = detail.get("visited", 0)
         points = detail.get("points", 0)
         total_chars = detail.get("totalCharacters", 0)
-        keywords = ", ".join(detail.get("keywords", []))
+        keywords = ", ".join(dict.fromkeys(normalize_tag(k) for k in detail.get("keywords", [])))
         attentions = ", ".join(detail.get("attentions", []))
 
         jp = detail.get("jp", 0)
@@ -193,6 +215,105 @@ class NovelDetailScreen(Screen):
         self.app.pop_screen()
 
 
+# ── 標籤篩選頁 ──
+
+class TagFilterScreen(Screen):
+    """標籤篩選：多個 OR 群組以 AND 連結。
+
+    例：群組1(A|B) AND 群組2(C|D) → 作品需同時符合兩組。
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "取消"),
+        Binding("c", "copy_tag", "複製標籤"),
+        Binding("a", "add_group", "加入群組"),
+        Binding("d", "remove_group", "刪除上一群組"),
+        Binding("q", "apply", "確認篩選"),
+        Binding("backspace", "clear_all", "清除全部"),
+    ]
+
+    def __init__(self, tags_with_counts: list[tuple[str, int]],
+                 groups: list[set[str]]):
+        super().__init__()
+        self._tags_with_counts = tags_with_counts
+        self._groups: list[set[str]] = [set(g) for g in groups]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with VerticalScroll():
+            yield Static("", id="groups-display")
+            yield Label("  選擇標籤，加入新的 OR 群組（Space 切換）:")
+            selections = []
+            for tag, count in self._tags_with_counts:
+                display = f"{_get_s2twp().convert(tag)} ({count})"
+                selections.append((display, tag, False))
+            yield SelectionList(*selections, id="tag-list")
+        yield Footer()
+
+    def on_mount(self):
+        self._update_groups_display()
+        self.query_one("#tag-list", SelectionList).focus()
+
+    def _update_groups_display(self):
+        if not self._groups:
+            text = "  （尚未建立篩選群組）"
+        else:
+            lines = []
+            for i, group in enumerate(self._groups, 1):
+                tags_str = " | ".join(
+                    _get_s2twp().convert(t) for t in sorted(group)
+                )
+                lines.append(f"  群組 {i}: {tags_str}")
+            lines.append("")
+            lines.append("  群組之間為 AND，群組內為 OR")
+            text = "\n".join(lines)
+        self.query_one("#groups-display", Static).update(text)
+
+    def _get_selected_tags(self) -> set[str]:
+        return set(self.query_one("#tag-list", SelectionList).selected)
+
+    def _clear_selection(self):
+        tag_list = self.query_one("#tag-list", SelectionList)
+        for tag, _count in self._tags_with_counts:
+            tag_list.deselect(tag)
+
+    def action_add_group(self):
+        selected = self._get_selected_tags()
+        if selected:
+            self._groups.append(selected)
+            self._clear_selection()
+            self._update_groups_display()
+        else:
+            self.notify("請先選擇至少一個標籤", timeout=2)
+
+    def action_remove_group(self):
+        if self._groups:
+            self._groups.pop()
+            self._update_groups_display()
+
+    def action_apply(self):
+        selected = self._get_selected_tags()
+        if selected:
+            self._groups.append(selected)
+        self.dismiss(self._groups)
+
+    def action_clear_all(self):
+        self.dismiss([])
+
+    def action_copy_tag(self):
+        tag_list = self.query_one("#tag-list", SelectionList)
+        idx = tag_list.highlighted
+        if idx is not None and 0 <= idx < len(self._tags_with_counts):
+            tag = self._tags_with_counts[idx][0]
+            subprocess.run(
+                ["clip"], input=tag.encode("utf-16le"),
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self.notify(f"已複製: {tag}", timeout=2)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
 # ── 列表頁（通用） ──
 
 class NovelListScreen(Screen):
@@ -207,6 +328,7 @@ class NovelListScreen(Screen):
         Binding("o", "open_in_browser", "瀏覽器開啟"),
         Binding("c", "copy_title", "複製標題"),
         Binding("s", "cycle_sort", "切換排序"),
+        Binding("t", "tag_filter", "標籤篩選"),
         Binding("r", "reload_char_map", "重載字元表"),
     ]
 
@@ -229,6 +351,7 @@ class NovelListScreen(Screen):
         self.marked: set[int] = set()
         self._filtering = False
         self._sort_index = 0
+        self._tag_filter: list[set[str]] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -242,6 +365,7 @@ class NovelListScreen(Screen):
         self.query_one("#filter-input", Input).display = False
         table = self.query_one("#novel-table", DataTable)
         table.cursor_type = "row"
+        table.focus()
         self._setup_columns(table)
         self._load_data()
 
@@ -272,6 +396,10 @@ class NovelListScreen(Screen):
             title = self._get_display_title(item)
             if filter_lower and filter_lower not in title.lower():
                 continue
+            if self._tag_filter:
+                item_tags = {normalize_tag(t) for t in item.get("keywords") or []}
+                if not all(group & item_tags for group in self._tag_filter):
+                    continue
             mark = "*" if i in self.marked else " "
             row_data = self._get_row_data(item)
             if self._is_r18(item):
@@ -303,14 +431,41 @@ class NovelListScreen(Screen):
                 reverse=True,
             )
 
+    def _collect_tags(self) -> list[tuple[str, int]]:
+        """從所有項目收集正規化後的標籤及出現次數，按次數降序排列。"""
+        tag_counts: dict[str, int] = defaultdict(int)
+        for item in self._items_original:
+            for tag in item.get("keywords") or []:
+                tag_counts[normalize_tag(tag)] += 1
+        return sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))
+
+    def action_tag_filter(self):
+        tags = self._collect_tags()
+        if not tags:
+            self.notify("目前列表沒有標籤資料", timeout=2)
+            return
+        self.app.push_screen(
+            TagFilterScreen(tags, list(self._tag_filter)),
+            callback=self._on_tag_filter_result,
+        )
+
+    def _on_tag_filter_result(self, result):
+        if result is None:
+            return
+        self._tag_filter = result
+        self._refresh_table()
+
     def _update_status(self):
         sort_name = self.SORT_MODES[self._sort_index][0]
         status = self.query_one("#status-bar", Label)
-        status.update(
+        msg = (
             f"  第 {self.current_page + 1} 頁 / 共 {self.total_pages} 頁"
             f"    共 {len(self.items)} 筆"
             f"    排序: {sort_name}"
         )
+        if self._tag_filter:
+            msg += f"    標籤篩選: {len(self._tag_filter)} 組"
+        status.update(msg)
 
     def _get_selected_item(self) -> dict | None:
         table = self.query_one("#novel-table", DataTable)
@@ -413,9 +568,13 @@ class NovelListScreen(Screen):
 
     def action_reload_char_map(self):
         load_char_map()
+        load_tag_map()
         self._refresh_table()
         status = self.query_one("#status-bar", Label)
-        status.update(f"  字元替換表已重載（{len(_char_map)} 筆）")
+        status.update(
+            f"  字元替換表已重載（{len(_char_map)} 筆）"
+            f"  標籤歸類表已重載（{len(_tag_map)} 筆）"
+        )
 
     def action_cycle_sort(self):
         self._sort_index = (self._sort_index + 1) % len(self.SORT_MODES)
@@ -618,7 +777,7 @@ class SearchScreen(NovelListScreen):
         comments = item.get("commentCount", 0)
         update_at = item.get("updateAt", 0)
         date_str = _time.strftime("%Y-%m-%d", _time.localtime(update_at)) if update_at else ""
-        keywords = ", ".join(item.get("keywords", []))
+        keywords = ", ".join(dict.fromkeys(normalize_tag(k) for k in item.get("keywords", [])))
         keywords = truncate_to_width(normalize_for_table(keywords), self.KEYWORDS_WIDTH)
         return (title, str(total), str(comments), date_str, keywords)
 
@@ -628,9 +787,10 @@ class SearchScreen(NovelListScreen):
 class RecommendScreen(NovelListScreen):
     """三執行緒並行：掃描論壇 / 載入小說資訊 / 使用者操作列表。"""
 
-    def __init__(self, api: NoveliaAPI, cache_dir: str):
+    def __init__(self, api: NoveliaAPI, cache_dir: str, full_scan: bool = False):
         super().__init__(api, title="論壇推薦統計")
         self._cache_dir = cache_dir
+        self._full_scan = full_scan
         self._cancel_event = threading.Event()
         # 掃描統計（由 scan 執行緒寫入，主執行緒讀取）
         self._stats: dict[tuple[str, str], dict] = {}
@@ -649,6 +809,7 @@ class RecommendScreen(NovelListScreen):
 
     KEYWORD_WIDTH = 50
     TITLE_WIDTH = 140
+    PAGE_SIZE = 100
 
     def _setup_columns(self, table: DataTable):
         table.add_columns(" ", "標題", "總提到", "文章提到", "留言提到", "小說留言數", "標籤")
@@ -675,8 +836,6 @@ class RecommendScreen(NovelListScreen):
                         self._enrich_count[1] += 1
                         self._enrich_queue.put(key)
             self._rebuild_items()
-
-        self.total_pages = 1
 
         # 啟動兩個背景執行緒
         self.run_worker(self._scan_worker, thread=True)
@@ -730,6 +889,7 @@ class RecommendScreen(NovelListScreen):
             forum_data = scan_forum_incremental(
                 self.api, self._cache_dir,
                 force_refresh=False,
+                full_scan=self._full_scan,
                 on_progress=on_progress,
                 on_article=on_article,
                 cancel_check=lambda: self._cancel_event.is_set(),
@@ -831,9 +991,69 @@ class RecommendScreen(NovelListScreen):
         self._refresh_table()
         self._update_status_bar()
 
+    def _get_filtered_items(self):
+        """回傳過濾後的 (原始索引, item) 列表。"""
+        filter_lower = self.filter_text.lower()
+        result = []
+        for i, item in enumerate(self.items):
+            if filter_lower and filter_lower not in self._get_display_title(item).lower():
+                continue
+            if self._tag_filter:
+                item_tags = {normalize_tag(t) for t in item.get("keywords") or []}
+                if not all(group & item_tags for group in self._tag_filter):
+                    continue
+            result.append((i, item))
+        return result
+
+    def _update_total_pages(self):
+        filtered = self._get_filtered_items()
+        self.total_pages = max(1, -(-len(filtered) // self.PAGE_SIZE))
+        if self.current_page >= self.total_pages:
+            self.current_page = max(0, self.total_pages - 1)
+
+    def _refresh_table(self):
+        filtered = self._get_filtered_items()
+        self.total_pages = max(1, -(-len(filtered) // self.PAGE_SIZE))
+        if self.current_page >= self.total_pages:
+            self.current_page = max(0, self.total_pages - 1)
+
+        start = self.current_page * self.PAGE_SIZE
+        end = start + self.PAGE_SIZE
+        page_items = filtered[start:end]
+
+        table = self.query_one("#novel-table", DataTable)
+        prev_cursor = table.cursor_row if table.row_count > 0 else 0
+        table.clear()
+        for i, item in page_items:
+            mark = "*" if i in self.marked else " "
+            row_data = self._get_row_data(item)
+            if self._is_r18(item):
+                row_data = tuple(
+                    Text(str(cell), style="bold magenta") for cell in row_data
+                )
+                mark = Text(mark, style="bold magenta")
+            table.add_row(mark, *row_data, key=str(i))
+        if table.row_count > 0:
+            table.move_cursor(row=min(prev_cursor, table.row_count - 1))
+        self._update_status_bar()
+
+    def action_prev_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self._refresh_table()
+
+    def action_next_page(self):
+        if self.current_page + 1 < self.total_pages:
+            self.current_page += 1
+            self._refresh_table()
+
     def _update_status_bar(self):
         sort_name = self.SORT_MODES[self._sort_index][0]
-        parts = [f"  共 {len(self.items)} 筆", f"排序: {sort_name}"]
+        parts = [
+            f"  第 {self.current_page + 1}/{self.total_pages} 頁",
+            f"共 {len(self.items)} 筆",
+            f"排序: {sort_name}",
+        ]
 
         if not self._scan_done.is_set():
             parts.append(f"掃描: {self._scan_status_msg}")
@@ -844,6 +1064,9 @@ class RecommendScreen(NovelListScreen):
             parts.append(f"小說資訊: {self._enrich_count[0]}/{self._enrich_count[1]}")
         elif self._enrich_done.is_set():
             parts.append("小說資訊載入完成")
+
+        if self._tag_filter:
+            parts.append(f"標籤篩選: {len(self._tag_filter)} 組")
 
         status = self.query_one("#status-bar", Label)
         status.update("    ".join(parts))
@@ -856,7 +1079,7 @@ class RecommendScreen(NovelListScreen):
     def _get_row_data(self, item: dict) -> tuple:
         title = self._get_display_title(item)
         title = truncate_to_width(title, self.TITLE_WIDTH)
-        keywords = ", ".join(item.get("keywords") or [])
+        keywords = ", ".join(dict.fromkeys(normalize_tag(k) for k in item.get("keywords") or []))
         keywords = truncate_to_width(normalize_for_table(keywords), self.KEYWORD_WIDTH)
         return (
             title,
@@ -937,6 +1160,11 @@ class NoveliaApp(App):
         height: 8;
         margin: 0 2;
     }
+    #tag-list {
+        height: auto;
+        max-height: 80vh;
+        margin: 0 2;
+    }
     .form-title {
         text-style: bold;
         padding: 1 0;
@@ -968,6 +1196,7 @@ class NoveliaApp(App):
         yield OptionList(
             Option("搜尋小說", id="search"),
             Option("論壇推薦統計", id="recommend"),
+            Option("論壇推薦統計（完整掃描）", id="recommend-full"),
             Option("離開", id="quit"),
             id="main-menu",
         )
@@ -985,6 +1214,10 @@ class NoveliaApp(App):
         elif option_id == "recommend":
             self.push_screen(
                 RecommendScreen(self.api, self.cache_dir)
+            )
+        elif option_id == "recommend-full":
+            self.push_screen(
+                RecommendScreen(self.api, self.cache_dir, full_scan=True)
             )
         elif option_id == "quit":
             self.exit()
