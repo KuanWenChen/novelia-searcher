@@ -805,6 +805,7 @@ class RecommendScreen(NovelListScreen):
         self._article_stats: dict[str, dict] = {}
         self._scan_article_count = 0
         self._enrich_count = [0, 0]  # [completed, total_queued]
+        self._fail_cache: dict[str, int] = {}
         self._scan_status_msg = ""
 
     KEYWORD_WIDTH = 50
@@ -816,10 +817,11 @@ class RecommendScreen(NovelListScreen):
 
     def _load_data(self):
         from recommend import (load_novel_info_cache, load_stats_cache,
-                               build_stats_from_article_stats)
+                               build_stats_from_article_stats, load_fail_cache)
 
         self._enrich_queue = queue.Queue()
         self._novel_cache = load_novel_info_cache(self._cache_dir)
+        self._fail_cache = load_fail_cache(self._cache_dir)
         self._seen_novels = set(
             tuple(k.split("/", 1)) for k in self._novel_cache.keys() if "/" in k
         )
@@ -919,7 +921,9 @@ class RecommendScreen(NovelListScreen):
     # ── 執行緒 2：載入小說資訊 ──
 
     def _enrich_worker(self):
-        from recommend import fetch_novel_info, save_novel_info_cache
+        from recommend import fetch_novel_info, save_novel_info_cache, save_fail_cache
+
+        max_retries = 5
 
         while not self._cancel_event.is_set():
             try:
@@ -937,11 +941,20 @@ class RecommendScreen(NovelListScreen):
                     self.app.call_from_thread(self._rebuild_items)
                     continue
 
+            if self._fail_cache.get(key, 0) >= max_retries:
+                self._enrich_count[0] += 1
+                self._enrich_queue.task_done()
+                continue
+
             info = fetch_novel_info(self.api, provider, novel_id)
             if info:
                 with self._novel_cache_lock:
                     self._novel_cache[key] = info
                     save_novel_info_cache(self._cache_dir, self._novel_cache)
+                self._fail_cache.pop(key, None)
+            else:
+                self._fail_cache[key] = self._fail_cache.get(key, 0) + 1
+                save_fail_cache(self._cache_dir, self._fail_cache)
             self._enrich_count[0] += 1
             self._enrich_queue.task_done()
             self.app.call_from_thread(self._rebuild_items)

@@ -8,6 +8,7 @@ from api import NoveliaAPI, extract_novel_links, extract_links_from_comments
 CACHE_FILE = "forum_cache.json"
 NOVEL_INFO_CACHE_FILE = "novel_info_cache.json"
 STATS_CACHE_FILE = "stats_cache.json"
+FAIL_CACHE_FILE = "novel_fail_cache.json"
 
 
 def get_cache_path(cache_dir: str) -> str:
@@ -276,6 +277,22 @@ def load_novel_info_cache(cache_dir: str) -> dict[str, dict]:
 def save_novel_info_cache(cache_dir: str, data: dict[str, dict]):
     os.makedirs(cache_dir, exist_ok=True)
     path = os.path.join(cache_dir, NOVEL_INFO_CACHE_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_fail_cache(cache_dir: str) -> dict[str, int]:
+    """載入小說載入失敗次數快取，回傳 {provider/novel_id: fail_count}。"""
+    path = os.path.join(cache_dir, FAIL_CACHE_FILE)
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_fail_cache(cache_dir: str, data: dict[str, int]):
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, FAIL_CACHE_FILE)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
