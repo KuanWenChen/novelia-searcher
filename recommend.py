@@ -49,6 +49,7 @@ def _page_all_cached(page_articles: list[tuple[str, int]], cache: dict[str, dict
 
 def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
                            force_refresh: bool = False,
+                           full_scan: bool = False,
                            on_progress=None,
                            on_article=None,
                            cancel_check=None):
@@ -74,7 +75,8 @@ def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
     total_pages = first_page["pageNumber"]
 
     cached_article_count = len(_cache_articles(cache))
-    can_early_exit = (cached_article_count == cached_total_articles
+    can_early_exit = (not full_scan
+                      and cached_article_count == cached_total_articles
                       and total_pages == cached_total_pages)
 
     list_complete = True
