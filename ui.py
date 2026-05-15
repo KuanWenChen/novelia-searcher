@@ -591,9 +591,10 @@ class SearchFormScreen(Screen):
         Binding("escape", "go_back", "返回"),
     ]
 
-    def __init__(self, api: NoveliaAPI):
+    def __init__(self, api: NoveliaAPI, cache_dir: str = "./cache"):
         super().__init__()
         self.api = api
+        self.cache_dir = cache_dir
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -689,7 +690,7 @@ class SearchFormScreen(Screen):
             params["min_comments"] = min_c
         params["page_size"] = page_size
 
-        self.app.push_screen(SearchScreen(self.api, params))
+        self.app.push_screen(SearchScreen(self.api, params, self.cache_dir))
 
     def action_go_back(self):
         self.app.pop_screen()
@@ -698,10 +699,12 @@ class SearchFormScreen(Screen):
 # ── 搜尋結果列表頁 ──
 
 class SearchScreen(NovelListScreen):
-    def __init__(self, api: NoveliaAPI, search_params: dict):
+    def __init__(self, api: NoveliaAPI, search_params: dict,
+                 cache_dir: str = "./cache"):
         super().__init__(api, title="小說搜尋")
         self.min_comments = search_params.pop("min_comments", None)
         self.search_params = search_params
+        self._cache_dir = cache_dir
 
     def _setup_columns(self, table: DataTable):
         table.add_columns(" ", "標題", "章數", "留言", "更新時間", "標籤")
@@ -739,18 +742,20 @@ class SearchScreen(NovelListScreen):
         self.run_worker(self._enrich_thread, thread=True)
 
     def _enrich_thread(self):
-        """第二階段：背景逐筆補留言數。"""
-        from search import enrich_comment_count
+        """第二階段：背景逐筆補留言數（含快取）。"""
+        from search import enrich_comment_count, _load_comment_cache, _save_comment_cache
+        cache = _load_comment_cache(self._cache_dir)
         items = self._items_original
         total = len(items)
         for i, item in enumerate(items):
             if item.get("commentCount") != "...":
                 continue
-            enrich_comment_count(self.api, item)
+            enrich_comment_count(self.api, item, cache=cache)
             # 留言數篩選
             if self.min_comments is not None and item["commentCount"] < self.min_comments:
                 item["_hidden"] = True
             self.app.call_from_thread(self._on_enrich_update, i + 1, total)
+        _save_comment_cache(self._cache_dir, cache)
 
     def _on_enrich_update(self, current, total):
         # 過濾掉被隱藏的項目
@@ -1223,7 +1228,7 @@ class NoveliaApp(App):
         log.info(f"選單選擇: {event.option.id}")
         option_id = event.option.id
         if option_id == "search":
-            self.push_screen(SearchFormScreen(self.api))
+            self.push_screen(SearchFormScreen(self.api, self.cache_dir))
         elif option_id == "recommend":
             self.push_screen(
                 RecommendScreen(self.api, self.cache_dir)
