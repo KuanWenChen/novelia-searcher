@@ -191,16 +191,49 @@ def scan_forum_incremental(api: NoveliaAPI, cache_dir: str,
     return list(_cache_articles(cache).values())
 
 
+_novel_redirect: dict[str, str] = {}
+
+
+def load_novel_redirect() -> dict[str, str]:
+    """載入小說重導向對照表，回傳 {"provider/id": "provider/id"}。"""
+    global _novel_redirect
+    path = os.path.join(os.path.dirname(__file__), "novel_redirect.json")
+    if not os.path.exists(path):
+        _novel_redirect = {}
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            _novel_redirect = json.load(f)
+    return _novel_redirect
+
+
+load_novel_redirect()
+
+
+def _apply_redirect(links: list[tuple[str, str]],
+                    redirect: dict[str, str]) -> list[tuple[str, str]]:
+    """將連結依重導向表轉換。"""
+    result = []
+    for p, n in links:
+        key = f"{p}/{n}"
+        target = redirect.get(key, key)
+        parts = target.split("/", 1)
+        result.append((parts[0], parts[1]))
+    return result
+
+
 def compute_entry_links(entry: dict) -> dict:
     """從一篇文章提取去重後的小說連結，回傳可序列化的結果。"""
     article = entry["article"]
     comments = entry["comments"]
+    redirect = _novel_redirect
 
     article_links = list({
-        (p, n) for p, n in extract_novel_links(article.get("content", ""))
+        (p, n) for p, n in _apply_redirect(
+            extract_novel_links(article.get("content", "")), redirect)
     })
     comment_links = list({
-        (p, n) for p, n in extract_links_from_comments(comments)
+        (p, n) for p, n in _apply_redirect(
+            extract_links_from_comments(comments), redirect)
     })
 
     return {
@@ -229,6 +262,14 @@ def save_stats_cache(cache_dir: str, data: dict[str, dict]):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _redirect_key(p: str, nid: str) -> tuple[str, str]:
+    """套用重導向，回傳 (provider, novel_id)。"""
+    raw = f"{p}/{nid}"
+    target = _novel_redirect.get(raw, raw)
+    parts = target.split("/", 1)
+    return (parts[0], parts[1])
+
+
 def build_stats_from_article_stats(
     article_stats: dict[str, dict],
 ) -> dict[tuple[str, str], dict]:
@@ -239,7 +280,7 @@ def build_stats_from_article_stats(
 
         seen_in_article: set[tuple[str, str]] = set()
         for p, nid in adata.get("article_links", []):
-            key = (p, nid)
+            key = _redirect_key(p, nid)
             if key not in seen_in_article:
                 if key not in stats:
                     stats[key] = {"article_count": 0, "comment_count": 0,
@@ -250,7 +291,7 @@ def build_stats_from_article_stats(
 
         seen_in_comments: set[tuple[str, str]] = set()
         for p, nid in adata.get("comment_links", []):
-            key = (p, nid)
+            key = _redirect_key(p, nid)
             if key not in seen_in_comments:
                 if key not in stats:
                     stats[key] = {"article_count": 0, "comment_count": 0,

@@ -568,13 +568,16 @@ class NovelListScreen(Screen):
         self._refresh_table()
 
     def action_reload_char_map(self):
+        from recommend import load_novel_redirect
         load_char_map()
         load_tag_map()
+        redirect = load_novel_redirect()
         self._refresh_table()
         status = self.query_one("#status-bar", Label)
         status.update(
             f"  字元替換表已重載（{len(_char_map)} 筆）"
             f"  標籤歸類表已重載（{len(_tag_map)} 筆）"
+            f"  小說重導向已重載（{len(redirect)} 筆）"
         )
 
     def action_cycle_sort(self):
