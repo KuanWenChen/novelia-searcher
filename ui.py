@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import os
@@ -792,6 +793,18 @@ class SearchScreen(NovelListScreen):
 class RecommendScreen(NovelListScreen):
     """三執行緒並行：掃描論壇 / 載入小說資訊 / 使用者操作列表。"""
 
+    BINDINGS = NovelListScreen.BINDINGS + [
+        Binding("f", "refresh_nearby", "重載附近小說資訊"),
+        Binding("w", "cycle_type_filter", "篩選狀態"),
+    ]
+
+    TYPE_FILTERS = [
+        ("全部", None),
+        ("連載", "连载中"),
+        ("完結", "已完结"),
+        ("短篇", "短篇"),
+    ]
+
     def __init__(self, api: NoveliaAPI, cache_dir: str, full_scan: bool = False):
         super().__init__(api, title="論壇推薦統計")
         self._cache_dir = cache_dir
@@ -804,7 +817,7 @@ class RecommendScreen(NovelListScreen):
         self._novel_cache: dict[str, dict] = {}
         self._novel_cache_lock = threading.Lock()
         self._seen_novels: set[tuple[str, str]] = set()
-        self._enrich_queue: queue.Queue[tuple[str, str]] = None  # type: ignore
+        self._enrich_queue: queue.PriorityQueue[tuple[int, str, str]] = None  # type: ignore
         self._scan_done = threading.Event()
         self._enrich_done = threading.Event()
         self._article_stats: dict[str, dict] = {}
@@ -812,23 +825,25 @@ class RecommendScreen(NovelListScreen):
         self._enrich_count = [0, 0]  # [completed, total_queued]
         self._fail_cache: dict[str, int] = {}
         self._scan_status_msg = ""
+        self._type_filter_index = 0
 
     KEYWORD_WIDTH = 50
     TITLE_WIDTH = 140
     PAGE_SIZE = 100
 
     def _setup_columns(self, table: DataTable):
-        table.add_columns(" ", "標題", "總提到", "文章提到", "留言提到", "小說留言數", "標籤")
+        table.add_columns(" ", "標題", "狀態", "最後更新", "總提到", "小說留言數", "快取時間", "標籤")
 
     def _load_data(self):
         from recommend import (load_novel_info_cache, load_stats_cache,
                                build_stats_from_article_stats, load_fail_cache)
 
-        self._enrich_queue = queue.Queue()
+        self._enrich_queue = queue.PriorityQueue()
         self._novel_cache = load_novel_info_cache(self._cache_dir)
         self._fail_cache = load_fail_cache(self._cache_dir)
         self._seen_novels = set(
-            tuple(k.split("/", 1)) for k in self._novel_cache.keys() if "/" in k
+            tuple(k.split("/", 1)) for k, v in self._novel_cache.items()
+            if "/" in k and v.get("type")
         )
 
         # 載入 per-article 統計快取 → 立即顯示列表
@@ -836,12 +851,13 @@ class RecommendScreen(NovelListScreen):
         if self._article_stats:
             with self._stats_lock:
                 self._stats = build_stats_from_article_stats(self._article_stats)
-                # 將已知小說加入 enrich 佇列
+                # 將已知小說加入 enrich 佇列（依推薦次數高→低）
                 for key in self._stats.keys():
                     if key not in self._seen_novels:
                         self._seen_novels.add(key)
                         self._enrich_count[1] += 1
-                        self._enrich_queue.put(key)
+                        total = self._stats[key]["total_count"]
+                        self._enrich_queue.put((-total, key[0], key[1]))
             self._rebuild_items()
 
         # 啟動兩個背景執行緒
@@ -888,7 +904,8 @@ class RecommendScreen(NovelListScreen):
                     if key not in self._seen_novels:
                         self._seen_novels.add(key)
                         self._enrich_count[1] += 1
-                        self._enrich_queue.put(key)
+                        total = self._stats[key]["total_count"]
+                        self._enrich_queue.put((-total, key[0], key[1]))
             save_stats_cache(self._cache_dir, self._article_stats)
             self.app.call_from_thread(self._rebuild_items)
 
@@ -932,7 +949,7 @@ class RecommendScreen(NovelListScreen):
 
         while not self._cancel_event.is_set():
             try:
-                provider, novel_id = self._enrich_queue.get(timeout=0.5)
+                _priority, provider, novel_id = self._enrich_queue.get(timeout=0.5)
             except queue.Empty:
                 if self._scan_done.is_set() and self._enrich_queue.empty():
                     break
@@ -940,7 +957,8 @@ class RecommendScreen(NovelListScreen):
 
             key = f"{provider}/{novel_id}"
             with self._novel_cache_lock:
-                if key in self._novel_cache:
+                cached_info = self._novel_cache.get(key)
+                if cached_info and cached_info.get("type"):
                     self._enrich_count[0] += 1
                     self._enrich_queue.task_done()
                     self.app.call_from_thread(self._rebuild_items)
@@ -984,11 +1002,17 @@ class RecommendScreen(NovelListScreen):
                 keywords = cached.get("keywords", [])
                 novel_comment_count = cached.get("novel_comment_count", 0)
                 attentions = cached.get("attentions", [])
+                novel_type = cached.get("type", "")
+                sync_at = cached.get("syncAt", 0)
+                cached_at = cached.get("cached_at", 0)
             else:
                 title = key
                 keywords = []
                 novel_comment_count = 0
                 attentions = []
+                novel_type = ""
+                sync_at = 0
+                cached_at = 0
 
             results.append({
                 "provider": provider,
@@ -1001,6 +1025,9 @@ class RecommendScreen(NovelListScreen):
                 "link": f"https://n.novelia.cc/novel/{provider}/{novel_id}",
                 "keywords": keywords,
                 "attentions": attentions,
+                "novel_type": novel_type,
+                "sync_at": sync_at,
+                "cached_at": cached_at,
             })
 
         results.sort(key=lambda x: x["total_count"], reverse=True)
@@ -1012,6 +1039,7 @@ class RecommendScreen(NovelListScreen):
     def _get_filtered_items(self):
         """回傳過濾後的 (原始索引, item) 列表。"""
         filter_lower = self.filter_text.lower()
+        type_filter = self.TYPE_FILTERS[self._type_filter_index][1]
         result = []
         for i, item in enumerate(self.items):
             if filter_lower and filter_lower not in self._get_display_title(item).lower():
@@ -1020,6 +1048,8 @@ class RecommendScreen(NovelListScreen):
                 item_tags = {normalize_tag(t) for t in item.get("keywords") or []}
                 if not all(group & item_tags for group in self._tag_filter):
                     continue
+            if type_filter and item.get("novel_type", "") != type_filter:
+                continue
             result.append((i, item))
         return result
 
@@ -1086,6 +1116,10 @@ class RecommendScreen(NovelListScreen):
         if self._tag_filter:
             parts.append(f"標籤篩選: {len(self._tag_filter)} 組")
 
+        type_name = self.TYPE_FILTERS[self._type_filter_index][0]
+        if type_name != "全部":
+            parts.append(f"狀態: {type_name}")
+
         status = self.query_one("#status-bar", Label)
         status.update("    ".join(parts))
 
@@ -1099,12 +1133,32 @@ class RecommendScreen(NovelListScreen):
         title = truncate_to_width(title, self.TITLE_WIDTH)
         keywords = ", ".join(dict.fromkeys(normalize_tag(k) for k in item.get("keywords") or []))
         keywords = truncate_to_width(normalize_for_table(keywords), self.KEYWORD_WIDTH)
+        novel_type = item.get("novel_type", "")
+        if novel_type == "已完结":
+            status = "完結"
+        elif novel_type == "连载中":
+            status = "連載"
+        elif novel_type == "短篇":
+            status = "短篇"
+        else:
+            status = ""
+        sync_at = item.get("sync_at", 0)
+        if sync_at:
+            sync_str = datetime.datetime.fromtimestamp(sync_at).strftime("%Y-%m-%d")
+        else:
+            sync_str = ""
+        cached_at = item.get("cached_at", 0)
+        if cached_at:
+            cached_str = datetime.datetime.fromtimestamp(cached_at).strftime("%Y-%m-%d")
+        else:
+            cached_str = ""
         return (
             title,
+            status,
+            sync_str,
             str(item.get("total_count", 0)),
-            str(item.get("article_count", 0)),
-            str(item.get("comment_count", 0)),
             str(item.get("novel_comment_count", 0)),
+            cached_str,
             keywords,
         )
 
@@ -1125,6 +1179,66 @@ class RecommendScreen(NovelListScreen):
             novel_id = item.get("novel_id", "")
             if provider and novel_id:
                 self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
+
+    def action_cycle_type_filter(self):
+        self._type_filter_index = (self._type_filter_index + 1) % len(self.TYPE_FILTERS)
+        self.current_page = 0
+        self._refresh_table()
+
+    def action_refresh_nearby(self):
+        """重新載入游標附近 ±5 筆小說資訊（快取 < 1 週則跳過），從最近的開始。"""
+        table = self.query_one("#novel-table", DataTable)
+        if table.row_count == 0:
+            return
+        cursor_row = table.cursor_row
+        filtered = self._get_filtered_items()
+        start = self.current_page * self.PAGE_SIZE
+        page_items = filtered[start:start + self.PAGE_SIZE]
+        if not page_items:
+            return
+
+        # 依距離游標由近到遠排序
+        lo = max(0, cursor_row - 5)
+        hi = min(len(page_items), cursor_row + 6)
+        indices = list(range(lo, hi))
+        indices.sort(key=lambda x: abs(x - cursor_row))
+
+        one_week = 7 * 24 * 3600
+        now = int(_time.time())
+        to_refresh = []
+        for idx in indices:
+            _i, item = page_items[idx]
+            cached_at = item.get("cached_at", 0)
+            if cached_at and (now - cached_at) < one_week:
+                continue
+            provider = item.get("provider", "")
+            novel_id = item.get("novel_id", "")
+            if provider and novel_id:
+                to_refresh.append((provider, novel_id))
+
+        if not to_refresh:
+            self.notify("附近小說快取皆為最新（< 1 週）")
+            return
+
+        self.notify(f"重新載入 {len(to_refresh)} 筆小說資訊...")
+
+        def _do_refresh():
+            from recommend import fetch_novel_info, save_novel_info_cache
+            for provider, novel_id in to_refresh:
+                if self._cancel_event.is_set():
+                    break
+                info = fetch_novel_info(self.api, provider, novel_id)
+                if info:
+                    key = f"{provider}/{novel_id}"
+                    with self._novel_cache_lock:
+                        self._novel_cache[key] = info
+                        save_novel_info_cache(self._cache_dir, self._novel_cache)
+                    self.app.call_from_thread(self._rebuild_items)
+            self.app.call_from_thread(
+                self.notify, f"重新載入完成（{len(to_refresh)} 筆）"
+            )
+
+        threading.Thread(target=_do_refresh, daemon=True).start()
 
     def action_cancel_filter_or_back(self):
         if self._filtering:

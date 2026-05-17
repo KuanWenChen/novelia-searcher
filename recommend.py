@@ -313,12 +313,18 @@ def prepare_recommend_data(stats: dict[tuple[str, str], dict],
             keywords = cached.get("keywords", [])
             novel_comment_count = cached.get("novel_comment_count", 0)
             attentions = cached.get("attentions", [])
+            novel_type = cached.get("type", "")
+            sync_at = cached.get("syncAt", 0)
+            cached_at = cached.get("cached_at", 0)
             enriched = True
         else:
             title = key
             keywords = []
             novel_comment_count = 0
             attentions = []
+            novel_type = ""
+            sync_at = 0
+            cached_at = 0
             enriched = False
 
         results.append({
@@ -332,6 +338,9 @@ def prepare_recommend_data(stats: dict[tuple[str, str], dict],
             "link": f"https://n.novelia.cc/novel/{provider}/{novel_id}",
             "keywords": keywords,
             "attentions": attentions,
+            "novel_type": novel_type,
+            "sync_at": sync_at,
+            "cached_at": cached_at,
             "enriched": enriched,
         })
 
@@ -352,6 +361,9 @@ def fetch_novel_info(api: NoveliaAPI, provider: str, novel_id: str) -> dict | No
             "keywords": keywords,
             "novel_comment_count": novel_comment_count,
             "attentions": detail.get("attentions") or [],
+            "type": detail.get("type", ""),
+            "syncAt": detail.get("syncAt", 0),
+            "cached_at": int(time.time()),
         }
     except Exception:
         return None
