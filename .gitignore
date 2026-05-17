@@ -10,3 +10,4 @@ build/
 .claude/
 ai-temp-command.md
 image*.png
+tracking.json

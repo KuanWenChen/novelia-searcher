@@ -108,6 +108,22 @@ def truncate_to_width(s: str, max_width: int) -> str:
     return "..."
 
 
+TRACKING_FILE = "tracking.json"
+
+
+def load_tracking() -> list[dict]:
+    """載入追蹤清單，回傳 [{provider, novel_id, tracked_at, no_refresh}, ...]。"""
+    if not os.path.exists(TRACKING_FILE):
+        return []
+    with open(TRACKING_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_tracking(data: list[dict]):
+    with open(TRACKING_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 # ── 詳情頁 ──
 
 class NovelDetailScreen(Screen):
@@ -799,6 +815,7 @@ class RecommendScreen(NovelListScreen):
     BINDINGS = NovelListScreen.BINDINGS + [
         Binding("f", "refresh_nearby", "重載附近小說資訊"),
         Binding("w", "cycle_type_filter", "篩選狀態"),
+        Binding("a", "add_tracking", "加入追蹤"),
     ]
 
     TYPE_FILTERS = [
@@ -1183,6 +1200,31 @@ class RecommendScreen(NovelListScreen):
             if provider and novel_id:
                 self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
 
+    def action_add_tracking(self):
+        """將目前選取的小說加入追蹤清單。"""
+        item = self._get_selected_item()
+        if not item:
+            return
+        provider = item.get("provider", "")
+        novel_id = item.get("novel_id", "")
+        if not provider or not novel_id:
+            return
+        tracking = load_tracking()
+        # 檢查是否已追蹤
+        for t in tracking:
+            if t["provider"] == provider and t["novel_id"] == novel_id:
+                self.notify("已在追蹤清單中")
+                return
+        tracking.append({
+            "provider": provider,
+            "novel_id": novel_id,
+            "tracked_at": int(_time.time()),
+            "no_refresh": False,
+        })
+        save_tracking(tracking)
+        title = self._get_display_title(item)
+        self.notify(f"已加入追蹤: {title}")
+
     def action_cycle_type_filter(self):
         self._type_filter_index = (self._type_filter_index + 1) % len(self.TYPE_FILTERS)
         self.current_page = 0
@@ -1242,6 +1284,263 @@ class RecommendScreen(NovelListScreen):
             )
 
         threading.Thread(target=_do_refresh, daemon=True).start()
+
+    def action_cancel_filter_or_back(self):
+        if self._filtering:
+            self._filtering = False
+            filter_input = self.query_one("#filter-input", Input)
+            filter_input.display = False
+            filter_input.value = ""
+            self.filter_text = ""
+            self._refresh_table()
+            self.query_one("#novel-table", DataTable).focus()
+        else:
+            self._cancel_event.set()
+            self.app.pop_screen()
+
+    def on_unmount(self):
+        self._cancel_event.set()
+
+
+# ── 追蹤清單頁 ──
+
+class TrackingScreen(NovelListScreen):
+    """顯示使用者追蹤的小說，自動更新過期快取。"""
+
+    BINDINGS = NovelListScreen.BINDINGS + [
+        Binding("d", "remove_tracking", "移除追蹤"),
+        Binding("n", "toggle_no_refresh", "切換免更新"),
+    ]
+
+    KEYWORD_WIDTH = 50
+    TITLE_WIDTH = 140
+    PAGE_SIZE = 100
+
+    def __init__(self, api: NoveliaAPI, cache_dir: str):
+        super().__init__(api, title="追蹤清單")
+        self._cache_dir = cache_dir
+        self._cancel_event = threading.Event()
+        self._novel_cache: dict[str, dict] = {}
+        self._novel_cache_lock = threading.Lock()
+        self._refresh_status = ""
+        self._refresh_done = threading.Event()
+
+    def _setup_columns(self, table: DataTable):
+        table.add_columns(" ", "標題", "狀態", "最後更新", "追蹤日期", "標籤")
+
+    def _load_data(self):
+        from recommend import load_novel_info_cache
+        self._novel_cache = load_novel_info_cache(self._cache_dir)
+        self._rebuild_items()
+        self.run_worker(self._refresh_worker, thread=True)
+
+    def _rebuild_items(self):
+        tracking = load_tracking()
+        results = []
+        for entry in tracking:
+            provider = entry["provider"]
+            novel_id = entry["novel_id"]
+            key = f"{provider}/{novel_id}"
+            with self._novel_cache_lock:
+                cached = self._novel_cache.get(key)
+            if cached:
+                title = cached.get("title", key)
+                keywords = cached.get("keywords", [])
+                novel_type = cached.get("type", "")
+                sync_at = cached.get("syncAt", 0)
+            else:
+                title = key
+                keywords = []
+                novel_type = ""
+                sync_at = 0
+
+            results.append({
+                "provider": provider,
+                "novel_id": novel_id,
+                "title": title,
+                "novel_type": novel_type,
+                "sync_at": sync_at,
+                "tracked_at": entry.get("tracked_at", 0),
+                "no_refresh": entry.get("no_refresh", False),
+                "keywords": keywords,
+                "link": f"https://n.novelia.cc/novel/{provider}/{novel_id}",
+            })
+
+        results.sort(key=lambda x: x["sync_at"], reverse=True)
+        self._items_original = results
+        self._apply_sort()
+        self._refresh_table()
+        self._update_status_bar()
+
+    def _refresh_worker(self):
+        """背景更新快取超過一週的追蹤小說。"""
+        from recommend import fetch_novel_info, save_novel_info_cache
+
+        tracking = load_tracking()
+        one_week = 7 * 24 * 3600
+        now = int(_time.time())
+        to_refresh = []
+        for entry in tracking:
+            if entry.get("no_refresh"):
+                continue
+            key = f"{entry['provider']}/{entry['novel_id']}"
+            with self._novel_cache_lock:
+                cached = self._novel_cache.get(key)
+            cached_at = cached.get("cached_at", 0) if cached else 0
+            if not cached or (now - cached_at) >= one_week:
+                to_refresh.append((entry["provider"], entry["novel_id"]))
+
+        for i, (provider, novel_id) in enumerate(to_refresh):
+            if self._cancel_event.is_set():
+                break
+            self._refresh_status = f"更新 {i + 1}/{len(to_refresh)}"
+            self.app.call_from_thread(self._update_status_bar)
+            info = fetch_novel_info(self.api, provider, novel_id)
+            if info:
+                key = f"{provider}/{novel_id}"
+                with self._novel_cache_lock:
+                    self._novel_cache[key] = info
+                    save_novel_info_cache(self._cache_dir, self._novel_cache)
+                self.app.call_from_thread(self._rebuild_items)
+
+        self._refresh_done.set()
+        self.app.call_from_thread(self._update_status_bar)
+
+    def _get_filtered_items(self):
+        filter_lower = self.filter_text.lower()
+        result = []
+        for i, item in enumerate(self.items):
+            if filter_lower and filter_lower not in self._get_display_title(item).lower():
+                continue
+            result.append((i, item))
+        return result
+
+    def _update_total_pages(self):
+        filtered = self._get_filtered_items()
+        self.total_pages = max(1, -(-len(filtered) // self.PAGE_SIZE))
+        if self.current_page >= self.total_pages:
+            self.current_page = max(0, self.total_pages - 1)
+
+    def _refresh_table(self):
+        filtered = self._get_filtered_items()
+        self.total_pages = max(1, -(-len(filtered) // self.PAGE_SIZE))
+        if self.current_page >= self.total_pages:
+            self.current_page = max(0, self.total_pages - 1)
+
+        start = self.current_page * self.PAGE_SIZE
+        end = start + self.PAGE_SIZE
+        page_items = filtered[start:end]
+
+        table = self.query_one("#novel-table", DataTable)
+        prev_cursor = table.cursor_row if table.row_count > 0 else 0
+        table.clear()
+        for i, item in page_items:
+            mark = "N" if item.get("no_refresh") else " "
+            row_data = self._get_row_data(item)
+            if self._is_r18(item):
+                row_data = tuple(
+                    Text(str(cell), style="bold magenta") for cell in row_data
+                )
+                mark = Text(mark, style="bold magenta")
+            table.add_row(mark, *row_data, key=str(i))
+        if table.row_count > 0:
+            table.move_cursor(row=min(prev_cursor, table.row_count - 1))
+        self._update_status_bar()
+
+    def _update_status_bar(self):
+        parts = [
+            f"  第 {self.current_page + 1}/{self.total_pages} 頁",
+            f"共 {len(self.items)} 筆",
+        ]
+        if not self._refresh_done.is_set():
+            if self._refresh_status:
+                parts.append(self._refresh_status)
+            else:
+                parts.append("檢查更新中...")
+        else:
+            parts.append("更新完成")
+        status = self.query_one("#status-bar", Label)
+        status.update("    ".join(parts))
+
+    def _get_display_title(self, item: dict) -> str:
+        title = item.get("title", "")
+        title = " ".join(title.split())
+        return normalize_for_table(_get_s2twp().convert(title))
+
+    def _get_row_data(self, item: dict) -> tuple:
+        title = self._get_display_title(item)
+        title = truncate_to_width(title, self.TITLE_WIDTH)
+        keywords = ", ".join(dict.fromkeys(normalize_tag(k) for k in item.get("keywords") or []))
+        keywords = truncate_to_width(normalize_for_table(keywords), self.KEYWORD_WIDTH)
+        novel_type = item.get("novel_type", "")
+        if novel_type == "已完结":
+            status = "完結"
+        elif novel_type == "连载中":
+            status = "連載"
+        elif novel_type == "短篇":
+            status = "短篇"
+        else:
+            status = ""
+        sync_at = item.get("sync_at", 0)
+        sync_str = datetime.datetime.fromtimestamp(sync_at).strftime("%Y-%m-%d") if sync_at else ""
+        tracked_at = item.get("tracked_at", 0)
+        tracked_str = datetime.datetime.fromtimestamp(tracked_at).strftime("%Y-%m-%d") if tracked_at else ""
+        return (
+            title,
+            status,
+            sync_str,
+            tracked_str,
+            keywords,
+        )
+
+    def _get_selected_item(self) -> dict | None:
+        table = self.query_one("#novel-table", DataTable)
+        if table.row_count == 0:
+            return None
+        cursor_key = list(table.rows.keys())[table.cursor_row]
+        idx = int(cursor_key.value)
+        if 0 <= idx < len(self.items):
+            return self.items[idx]
+        return None
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        item = self._get_selected_item()
+        if item:
+            provider = item.get("provider", "")
+            novel_id = item.get("novel_id", "")
+            if provider and novel_id:
+                self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
+
+    def action_remove_tracking(self):
+        """移除目前選取的小說追蹤。"""
+        item = self._get_selected_item()
+        if not item:
+            return
+        provider = item.get("provider", "")
+        novel_id = item.get("novel_id", "")
+        tracking = load_tracking()
+        tracking = [t for t in tracking
+                    if not (t["provider"] == provider and t["novel_id"] == novel_id)]
+        save_tracking(tracking)
+        self._rebuild_items()
+        self.notify("已移除追蹤")
+
+    def action_toggle_no_refresh(self):
+        """切換目前選取小說的免更新標記。"""
+        item = self._get_selected_item()
+        if not item:
+            return
+        provider = item.get("provider", "")
+        novel_id = item.get("novel_id", "")
+        tracking = load_tracking()
+        for t in tracking:
+            if t["provider"] == provider and t["novel_id"] == novel_id:
+                t["no_refresh"] = not t.get("no_refresh", False)
+                status = "開啟" if t["no_refresh"] else "關閉"
+                self.notify(f"免更新: {status}")
+                break
+        save_tracking(tracking)
+        self._rebuild_items()
 
     def action_cancel_filter_or_back(self):
         if self._filtering:
@@ -1330,6 +1629,7 @@ class NoveliaApp(App):
         yield Static("\n  Novelia Searcher\n", id="menu-title")
         yield OptionList(
             Option("搜尋小說", id="search"),
+            Option("追蹤清單", id="tracking"),
             Option("論壇推薦統計", id="recommend"),
             Option("論壇推薦統計（完整掃描）", id="recommend-full"),
             Option("離開", id="quit"),
@@ -1346,6 +1646,8 @@ class NoveliaApp(App):
         option_id = event.option.id
         if option_id == "search":
             self.push_screen(SearchFormScreen(self.api, self.cache_dir))
+        elif option_id == "tracking":
+            self.push_screen(TrackingScreen(self.api, self.cache_dir))
         elif option_id == "recommend":
             self.push_screen(
                 RecommendScreen(self.api, self.cache_dir)
