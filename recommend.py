@@ -355,7 +355,7 @@ def prepare_recommend_data(stats: dict[tuple[str, str], dict],
             novel_comment_count = cached.get("novel_comment_count", 0)
             attentions = cached.get("attentions", [])
             novel_type = cached.get("type", "")
-            sync_at = cached.get("syncAt", 0)
+            last_updated_at = cached.get("last_updated_at", 0)
             cached_at = cached.get("cached_at", 0)
             enriched = True
         else:
@@ -364,7 +364,7 @@ def prepare_recommend_data(stats: dict[tuple[str, str], dict],
             novel_comment_count = 0
             attentions = []
             novel_type = ""
-            sync_at = 0
+            last_updated_at = 0
             cached_at = 0
             enriched = False
 
@@ -380,13 +380,21 @@ def prepare_recommend_data(stats: dict[tuple[str, str], dict],
             "keywords": keywords,
             "attentions": attentions,
             "novel_type": novel_type,
-            "sync_at": sync_at,
+            "last_updated_at": last_updated_at,
             "cached_at": cached_at,
             "enriched": enriched,
         })
 
     results.sort(key=lambda x: x["total_count"], reverse=True)
     return results
+
+
+def _last_toc_created_at(detail: dict) -> int:
+    """取得 toc 最後一筆的 createAt（秒），無資料時回傳 0。"""
+    toc = detail.get("toc")
+    if toc:
+        return toc[-1].get("createAt", 0)
+    return 0
 
 
 def fetch_novel_info(api: NoveliaAPI, provider: str, novel_id: str) -> dict | None:
@@ -403,7 +411,7 @@ def fetch_novel_info(api: NoveliaAPI, provider: str, novel_id: str) -> dict | No
             "novel_comment_count": novel_comment_count,
             "attentions": detail.get("attentions") or [],
             "type": detail.get("type", ""),
-            "syncAt": detail.get("syncAt", 0),
+            "last_updated_at": _last_toc_created_at(detail),
             "cached_at": int(time.time()),
         }
     except Exception:

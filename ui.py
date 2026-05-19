@@ -626,6 +626,7 @@ class NovelListScreen(Screen):
         title = self._get_display_title(item)
         self.notify(f"已加入追蹤: {title}")
 
+
 # ── 搜尋參數設定頁 ──
 
 class SearchFormScreen(Screen):
@@ -882,9 +883,10 @@ class RecommendScreen(NovelListScreen):
         self._enrich_queue = queue.PriorityQueue()
         self._novel_cache = load_novel_info_cache(self._cache_dir)
         self._fail_cache = load_fail_cache(self._cache_dir)
+        _required_keys = {"title", "keywords", "novel_comment_count", "attentions", "type", "last_updated_at"}
         self._seen_novels = set(
             tuple(k.split("/", 1)) for k, v in self._novel_cache.items()
-            if "/" in k and v.get("type")
+            if "/" in k and _required_keys.issubset(v)
         )
 
         # 載入 per-article 統計快取 → 立即顯示列表
@@ -987,6 +989,7 @@ class RecommendScreen(NovelListScreen):
         from recommend import fetch_novel_info, save_novel_info_cache, save_fail_cache
 
         max_retries = 5
+        required_keys = {"title", "keywords", "novel_comment_count", "attentions", "type", "last_updated_at"}
 
         while not self._cancel_event.is_set():
             try:
@@ -999,7 +1002,7 @@ class RecommendScreen(NovelListScreen):
             key = f"{provider}/{novel_id}"
             with self._novel_cache_lock:
                 cached_info = self._novel_cache.get(key)
-                if cached_info and cached_info.get("type"):
+                if cached_info and required_keys.issubset(cached_info):
                     self._enrich_count[0] += 1
                     self._enrich_queue.task_done()
                     self.app.call_from_thread(self._rebuild_items)
@@ -1044,7 +1047,7 @@ class RecommendScreen(NovelListScreen):
                 novel_comment_count = cached.get("novel_comment_count", 0)
                 attentions = cached.get("attentions", [])
                 novel_type = cached.get("type", "")
-                sync_at = cached.get("syncAt", 0)
+                last_updated_at = cached.get("last_updated_at", 0)
                 cached_at = cached.get("cached_at", 0)
             else:
                 title = key
@@ -1052,7 +1055,7 @@ class RecommendScreen(NovelListScreen):
                 novel_comment_count = 0
                 attentions = []
                 novel_type = ""
-                sync_at = 0
+                last_updated_at = 0
                 cached_at = 0
 
             results.append({
@@ -1067,7 +1070,7 @@ class RecommendScreen(NovelListScreen):
                 "keywords": keywords,
                 "attentions": attentions,
                 "novel_type": novel_type,
-                "sync_at": sync_at,
+                "last_updated_at": last_updated_at,
                 "cached_at": cached_at,
             })
 
@@ -1183,11 +1186,11 @@ class RecommendScreen(NovelListScreen):
             status = "短篇"
         else:
             status = ""
-        sync_at = item.get("sync_at", 0)
-        if sync_at:
-            sync_str = datetime.datetime.fromtimestamp(sync_at).strftime("%Y-%m-%d")
+        last_updated_at = item.get("last_updated_at", 0)
+        if last_updated_at:
+            updated_str = datetime.datetime.fromtimestamp(last_updated_at).strftime("%Y-%m-%d")
         else:
-            sync_str = ""
+            updated_str = ""
         cached_at = item.get("cached_at", 0)
         if cached_at:
             cached_str = datetime.datetime.fromtimestamp(cached_at).strftime("%Y-%m-%d")
@@ -1196,7 +1199,7 @@ class RecommendScreen(NovelListScreen):
         return (
             title,
             status,
-            sync_str,
+            updated_str,
             str(item.get("total_count", 0)),
             str(item.get("novel_comment_count", 0)),
             cached_str,
@@ -1343,26 +1346,26 @@ class TrackingScreen(NovelListScreen):
                 title = cached.get("title", key)
                 keywords = cached.get("keywords", [])
                 novel_type = cached.get("type", "")
-                sync_at = cached.get("syncAt", 0)
+                last_updated_at = cached.get("last_updated_at", 0)
             else:
                 title = key
                 keywords = []
                 novel_type = ""
-                sync_at = 0
+                last_updated_at = 0
 
             results.append({
                 "provider": provider,
                 "novel_id": novel_id,
                 "title": title,
                 "novel_type": novel_type,
-                "sync_at": sync_at,
+                "last_updated_at": last_updated_at,
                 "tracked_at": entry.get("tracked_at", 0),
                 "no_refresh": entry.get("no_refresh", False),
                 "keywords": keywords,
                 "link": f"https://n.novelia.cc/novel/{provider}/{novel_id}",
             })
 
-        results.sort(key=lambda x: x["sync_at"], reverse=True)
+        results.sort(key=lambda x: x["last_updated_at"], reverse=True)
         self._items_original = results
         self._apply_sort()
         self._refresh_table()
@@ -1477,14 +1480,14 @@ class TrackingScreen(NovelListScreen):
             status = "短篇"
         else:
             status = ""
-        sync_at = item.get("sync_at", 0)
-        sync_str = datetime.datetime.fromtimestamp(sync_at).strftime("%Y-%m-%d") if sync_at else ""
+        last_updated_at = item.get("last_updated_at", 0)
+        updated_str = datetime.datetime.fromtimestamp(last_updated_at).strftime("%Y-%m-%d") if last_updated_at else ""
         tracked_at = item.get("tracked_at", 0)
         tracked_str = datetime.datetime.fromtimestamp(tracked_at).strftime("%Y-%m-%d") if tracked_at else ""
         return (
             title,
             status,
-            sync_str,
+            updated_str,
             tracked_str,
             keywords,
         )
