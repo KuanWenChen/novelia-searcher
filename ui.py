@@ -347,6 +347,7 @@ class NovelListScreen(Screen):
         Binding("s", "cycle_sort", "切換排序"),
         Binding("t", "tag_filter", "標籤篩選"),
         Binding("r", "reload_char_map", "重載字元表"),
+        Binding("a", "add_tracking", "加入追蹤"),
     ]
 
     current_page = reactive(0)
@@ -601,8 +602,29 @@ class NovelListScreen(Screen):
         self._apply_sort()
         self._refresh_table()
 
-
-
+    def action_add_tracking(self):
+        """將目前選取的小說加入追蹤清單。"""
+        item = self._get_selected_item()
+        if not item:
+            return
+        provider = item.get("providerId") or item.get("provider", "")
+        novel_id = item.get("novelId") or item.get("novel_id", "")
+        if not provider or not novel_id:
+            return
+        tracking = load_tracking()
+        for t in tracking:
+            if t["provider"] == provider and t["novel_id"] == novel_id:
+                self.notify("已在追蹤清單中")
+                return
+        tracking.append({
+            "provider": provider,
+            "novel_id": novel_id,
+            "tracked_at": int(_time.time()),
+            "no_refresh": False,
+        })
+        save_tracking(tracking)
+        title = self._get_display_title(item)
+        self.notify(f"已加入追蹤: {title}")
 
 # ── 搜尋參數設定頁 ──
 
@@ -815,7 +837,6 @@ class RecommendScreen(NovelListScreen):
     BINDINGS = NovelListScreen.BINDINGS + [
         Binding("f", "refresh_nearby", "重載附近小說資訊"),
         Binding("w", "cycle_type_filter", "篩選狀態"),
-        Binding("a", "add_tracking", "加入追蹤"),
     ]
 
     TYPE_FILTERS = [
@@ -1199,31 +1220,6 @@ class RecommendScreen(NovelListScreen):
             novel_id = item.get("novel_id", "")
             if provider and novel_id:
                 self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
-
-    def action_add_tracking(self):
-        """將目前選取的小說加入追蹤清單。"""
-        item = self._get_selected_item()
-        if not item:
-            return
-        provider = item.get("provider", "")
-        novel_id = item.get("novel_id", "")
-        if not provider or not novel_id:
-            return
-        tracking = load_tracking()
-        # 檢查是否已追蹤
-        for t in tracking:
-            if t["provider"] == provider and t["novel_id"] == novel_id:
-                self.notify("已在追蹤清單中")
-                return
-        tracking.append({
-            "provider": provider,
-            "novel_id": novel_id,
-            "tracked_at": int(_time.time()),
-            "no_refresh": False,
-        })
-        save_tracking(tracking)
-        title = self._get_display_title(item)
-        self.notify(f"已加入追蹤: {title}")
 
     def action_cycle_type_filter(self):
         self._type_filter_index = (self._type_filter_index + 1) % len(self.TYPE_FILTERS)
