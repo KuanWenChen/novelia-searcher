@@ -126,111 +126,6 @@ def save_tracking(data: list[dict]):
 
 # ── 詳情頁 ──
 
-class NovelDetailScreen(Screen):
-    BINDINGS = [
-        Binding("escape", "go_back", "返回"),
-    ]
-
-    def __init__(self, api: NoveliaAPI, provider: str, novel_id: str):
-        super().__init__()
-        self.api = api
-        self.provider = provider
-        self.novel_id = novel_id
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield VerticalScroll(Static(id="detail-content", markup=False))
-        yield Footer()
-
-    def on_mount(self):
-        self._load_detail()
-
-    def _load_detail(self):
-        content_widget = self.query_one("#detail-content", Static)
-        try:
-            detail = self.api.get_novel_detail(self.provider, self.novel_id)
-        except PermissionError as e:
-            content_widget.update(str(e))
-            return
-        except Exception as e:
-            content_widget.update(f"載入失敗: {e}")
-            return
-
-        title_zh = detail.get("titleZh") or ""
-        title_jp = detail.get("titleJp") or ""
-        intro_zh = detail.get("introductionZh") or ""
-        intro_jp = detail.get("introductionJp") or ""
-        visited = detail.get("visited", 0)
-        points = detail.get("points", 0)
-        total_chars = detail.get("totalCharacters", 0)
-        keywords = ", ".join(dict.fromkeys(normalize_tag(k) for k in detail.get("keywords", [])))
-        attentions = ", ".join(detail.get("attentions", []))
-
-        jp = detail.get("jp", 0)
-        baidu = detail.get("baidu", 0)
-        youdao = detail.get("youdao", 0)
-        gpt = detail.get("gpt", 0)
-        sakura = detail.get("sakura", 0)
-
-        authors = ", ".join(a.get("name", "") for a in detail.get("authors", []))
-
-        lines = [
-            f"{'─' * 60}",
-            f"  標題（中文）: {title_zh}",
-            f"  標題（日文）: {title_jp}",
-            f"  作者: {authors}",
-            f"  連結: https://n.novelia.cc/novel/{self.provider}/{self.novel_id}",
-            f"{'─' * 60}",
-            f"  瀏覽數: {visited}    評分: {points}    總字數: {total_chars}",
-            f"  翻譯狀態: 原文 {jp} / 百度 {baidu} / 有道 {youdao} / GPT {gpt} / Sakura {sakura}",
-            f"{'─' * 60}",
-        ]
-
-        if attentions:
-            lines.append(f"  注意事項: {attentions}")
-        if keywords:
-            lines.append(f"  關鍵字: {keywords}")
-
-        lines.append(f"{'─' * 60}")
-        lines.append("  簡介（中文）:")
-        lines.append(f"  {intro_zh}" if intro_zh else "  （無）")
-        lines.append("")
-        lines.append("  簡介（日文）:")
-        lines.append(f"  {intro_jp}" if intro_jp else "  （無）")
-        lines.append(f"{'─' * 60}")
-
-        # 載入留言
-        lines.append("")
-        lines.append("  留言:")
-        lines.append("")
-        try:
-            comments_data = self.api.get_comments(
-                f"web-{self.provider}-{self.novel_id}", page=0, page_size=20
-            )
-            comments = comments_data.get("items", [])
-            total_comment_pages = comments_data.get("pageNumber", 0)
-            if not comments:
-                lines.append("  （無留言）")
-            else:
-                for c in comments:
-                    user = c.get("user", {}).get("username", "匿名")
-                    text = c.get("content", "").strip()
-                    lines.append(f"  [{user}]: {text}")
-                    for reply in c.get("replies", []):
-                        r_user = reply.get("user", {}).get("username", "匿名")
-                        r_text = reply.get("content", "").strip()
-                        lines.append(f"    └ [{r_user}]: {r_text}")
-                    lines.append("")
-                if total_comment_pages > 1:
-                    lines.append(f"  （共 {total_comment_pages} 頁留言，僅顯示第 1 頁）")
-        except Exception as e:
-            lines.append(f"  載入留言失敗: {e}")
-
-        content_widget.update("\n".join(lines))
-
-    def action_go_back(self):
-        self.app.pop_screen()
-
 
 # ── 標籤篩選頁 ──
 
@@ -509,16 +404,17 @@ class NovelListScreen(Screen):
         return None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
-        """Enter / 滑鼠雙擊：開啟詳情頁"""
-        item = self._get_selected_item()
-        if item:
-            provider = item.get("providerId") or item.get("provider", "")
-            novel_id = item.get("novelId") or item.get("novel_id", "")
-            if provider and novel_id:
-                self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
+        """Enter / 滑鼠雙擊：用瀏覽器開啟"""
+        self.action_open_in_browser()
+
+    _last_open_time: float = 0.0
 
     def action_open_in_browser(self):
         """按 o：用瀏覽器開啟"""
+        now = _time.monotonic()
+        if now - self._last_open_time < 1.0:
+            return
+        self._last_open_time = now
         item = self._get_selected_item()
         if item:
             url = self._get_novel_url(item)
@@ -1244,12 +1140,7 @@ class RecommendScreen(NovelListScreen):
         return None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
-        item = self._get_selected_item()
-        if item:
-            provider = item.get("provider", "")
-            novel_id = item.get("novel_id", "")
-            if provider and novel_id:
-                self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
+        self.action_open_in_browser()
 
     def action_cycle_type_filter(self):
         self._type_filter_index = (self._type_filter_index + 1) % len(self.TYPE_FILTERS)
@@ -1530,12 +1421,7 @@ class TrackingScreen(NovelListScreen):
         return None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
-        item = self._get_selected_item()
-        if item:
-            provider = item.get("provider", "")
-            novel_id = item.get("novel_id", "")
-            if provider and novel_id:
-                self.app.push_screen(NovelDetailScreen(self.api, provider, novel_id))
+        self.action_open_in_browser()
 
     def action_remove_tracking(self):
         """移除目前選取的小說追蹤。"""
