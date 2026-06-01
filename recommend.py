@@ -277,6 +277,7 @@ def build_stats_from_article_stats(
     stats: dict[tuple[str, str], dict] = {}
     for aid, adata in article_stats.items():
         article_title = adata.get("title", "")
+        article_update_at = adata.get("updateAt", 0)
 
         seen_in_article: set[tuple[str, str]] = set()
         for p, nid in adata.get("article_links", []):
@@ -284,7 +285,8 @@ def build_stats_from_article_stats(
             if key not in seen_in_article:
                 if key not in stats:
                     stats[key] = {"article_count": 0, "comment_count": 0,
-                                  "total_count": 0, "articles": []}
+                                  "total_count": 0, "articles": [],
+                                  "last_mentioned_at": 0}
                 stats[key]["article_count"] += 1
                 stats[key]["articles"].append(article_title)
                 seen_in_article.add(key)
@@ -295,7 +297,8 @@ def build_stats_from_article_stats(
             if key not in seen_in_comments:
                 if key not in stats:
                     stats[key] = {"article_count": 0, "comment_count": 0,
-                                  "total_count": 0, "articles": []}
+                                  "total_count": 0, "articles": [],
+                                  "last_mentioned_at": 0}
                 stats[key]["comment_count"] += 1
                 seen_in_comments.add(key)
 
@@ -303,6 +306,8 @@ def build_stats_from_article_stats(
             stats[key]["total_count"] = (
                 stats[key]["article_count"] + stats[key]["comment_count"]
             )
+            if article_update_at > stats[key]["last_mentioned_at"]:
+                stats[key]["last_mentioned_at"] = article_update_at
     return stats
 
 

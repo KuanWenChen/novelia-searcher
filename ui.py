@@ -356,7 +356,13 @@ class NovelListScreen(Screen):
     SORT_MODES = [
         ("預設", None),
         ("更新時間", "updateAt"),
+        ("最後更新", "last_updated_at"),
+        ("被提到時間", "last_mentioned_at"),
         ("留言數", "commentCount"),
+        ("小說留言數", "novel_comment_count"),
+        ("總提到", "total_count"),
+        ("追蹤日期", "tracked_at"),
+        ("快取時間", "cached_at"),
     ]
 
     def __init__(self, api: NoveliaAPI, title: str = "小說列表"):
@@ -597,8 +603,22 @@ class NovelListScreen(Screen):
             f"  小說重導向已重載（{len(redirect)} 筆）"
         )
 
+    def _sort_mode_available(self, sort_key: str | None) -> bool:
+        """檢查當前項目是否包含此排序欄位。"""
+        if sort_key is None:
+            return True
+        for item in self._items_original[:1]:
+            if sort_key in item:
+                return True
+        return not self._items_original
+
     def action_cycle_sort(self):
-        self._sort_index = (self._sort_index + 1) % len(self.SORT_MODES)
+        n = len(self.SORT_MODES)
+        for _ in range(n):
+            self._sort_index = (self._sort_index + 1) % n
+            _, sort_key = self.SORT_MODES[self._sort_index]
+            if self._sort_mode_available(sort_key):
+                break
         self._apply_sort()
         self._refresh_table()
 
@@ -874,7 +894,7 @@ class RecommendScreen(NovelListScreen):
     PAGE_SIZE = 100
 
     def _setup_columns(self, table: DataTable):
-        table.add_columns(" ", "標題", "狀態", "最後更新", "總提到", "小說留言數", "快取時間", "標籤")
+        table.add_columns(" ", "標題", "狀態", "最後更新", "被提到時間", "總提到", "小說留言數", "快取時間", "標籤")
 
     def _load_data(self):
         from recommend import (load_novel_info_cache, load_stats_cache,
@@ -1066,6 +1086,7 @@ class RecommendScreen(NovelListScreen):
                 "article_count": val["article_count"],
                 "comment_count": val["comment_count"],
                 "novel_comment_count": novel_comment_count,
+                "last_mentioned_at": val.get("last_mentioned_at", 0),
                 "link": f"https://n.novelia.cc/novel/{provider}/{novel_id}",
                 "keywords": keywords,
                 "attentions": attentions,
@@ -1191,6 +1212,11 @@ class RecommendScreen(NovelListScreen):
             updated_str = datetime.datetime.fromtimestamp(last_updated_at).strftime("%Y-%m-%d")
         else:
             updated_str = ""
+        last_mentioned_at = item.get("last_mentioned_at", 0)
+        if last_mentioned_at:
+            mentioned_str = datetime.datetime.fromtimestamp(last_mentioned_at).strftime("%Y-%m-%d")
+        else:
+            mentioned_str = ""
         cached_at = item.get("cached_at", 0)
         if cached_at:
             cached_str = datetime.datetime.fromtimestamp(cached_at).strftime("%Y-%m-%d")
@@ -1200,6 +1226,7 @@ class RecommendScreen(NovelListScreen):
             title,
             status,
             updated_str,
+            mentioned_str,
             str(item.get("total_count", 0)),
             str(item.get("novel_comment_count", 0)),
             cached_str,
